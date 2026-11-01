@@ -22,6 +22,7 @@ TOOLS = Path(__file__).resolve().parents[1] / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 import open_ao_pr  # noqa: E402  (imported the same way the script runs)
+REAL_RUN = open_ao_pr.run
 
 APPROVED = "dev-james0723/agent-pooper-scooper"
 APPROVED_SPEC = f"github.com/{APPROVED}"
@@ -61,9 +62,9 @@ class FakeWorld:
             if self.on_tests:
                 self.on_tests()
             return "OK"
-        result = subprocess.run(args, cwd=root, capture_output=True, text=True,
-                                check=True, env=kwargs.get("env"))
-        return result.stdout.strip()
+        # Exercise the publisher's actual environment handling for local Git.
+        # Only network/gh/test subprocesses are simulated above.
+        return REAL_RUN(args, root)
 
     # -- git remote simulation ---------------------------------------------
     def _push(self, args):
@@ -293,6 +294,22 @@ class DestinationBindingTests(PublisherTestCase):
         self.repo.git("config", "url.https://evil.example/.insteadOf", "https://github.com/")
         self.assertRefused("URL")
 
+    def test_git_config_override_cannot_hide_https_rewrite_with_ssh_origin(self):
+        ssh = f"git@github.com:{APPROVED}.git"
+        self.repo.git("remote", "set-url", "origin", ssh)
+        self.repo.git("config", "url.https://unapproved.invalid/.insteadOf", "https://github.com/")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG": os.devnull}):
+            self.assertEqual(REAL_RUN(["git", "remote", "get-url", "origin"], self.repo.path), ssh)
+            self.assertEqual(REAL_RUN(["git", "remote", "get-url", "--push", "--all", "origin"], self.repo.path), ssh)
+            self.assertRefused("URL rewrites")
+        self.assertEqual(self.world.network_calls(), [])
+
+    def test_git_config_override_cannot_hide_promisor_store(self):
+        self.repo.git("config", "remote.origin.promisor", "true")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG": os.devnull}):
+            self.assertRefused("promisor")
+        self.assertEqual(self.world.network_calls(), [])
+
     def test_rejects_gh_repo_override(self):
         os.environ["GH_REPO"] = "attacker/fork"
         self.assertRefused("GH_REPO")
@@ -330,7 +347,7 @@ class DestinationBindingTests(PublisherTestCase):
             open_ao_pr.run(["gh", "pr", "view", "1", "--repo", APPROVED_SPEC], self.repo.path)
         env = process.call_args.kwargs["env"]
         self.assertEqual(env.get("GH_HOST"), "github.com")
-        self.assertNotIn("GH_REPO", env)
+        self.assertFalse("GH_REPO" in env, "ambient repository override retained")
 
 
 class ExistingPrTests(PublisherTestCase):

@@ -207,6 +207,10 @@ class HistoryScanTests(GateTestCase):
 
 
 class OfflineObjectStoreTests(GateTestCase):
+    def test_command_specific_git_config_override_is_removed(self):
+        with mock.patch.dict(os.environ, {"GIT_CONFIG": os.devnull}):
+            self.assertFalse("GIT_CONFIG" in git_env(), "command-specific config override retained")
+
     def test_partial_clone_refused_before_revision_resolution(self):
         self.repo.git("config", "extensions.partialClone", "origin")
         with mock.patch("tools.publication_gate.resolve_commit", wraps=resolve_commit) as resolving:

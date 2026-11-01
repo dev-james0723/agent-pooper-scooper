@@ -77,12 +77,12 @@ IDENTITY_HEADER = re.compile(r"(?m)^ ?(author|committer|tagger) [^<\n]*<([^>\n]*
 FORBIDDEN_WORKFLOW_EVENTS = ("pull_request" + "_target", "workflow" + "_run")
 ALLOWED_WORKFLOW_EVENTS = {"push", "pull_request", "workflow_dispatch", "schedule"}
 PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
-# Environment variables that could point Git at different objects or refs.
+# Environment overrides that could hide config or point Git at different objects/refs.
 _GIT_LOCATION_VARS = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE",
     "GIT_COMMON_DIR",
-    "GIT_SHALLOW_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+    "GIT_SHALLOW_FILE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
 )
 
 
