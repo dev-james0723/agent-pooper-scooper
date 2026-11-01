@@ -250,6 +250,42 @@ class AuthorityTests(unittest.TestCase):
                 self.assertFalse(sentinel in raw, "raw fixture payload persisted in control storage")
                 self.assertFalse(authority.base64.b64encode(sentinel) in raw, "encoded fixture payload persisted in control storage")
 
+    def test_owner_rpc_replay_never_rotates_generation_or_changes_task(self):
+        self.owner.register("other", "other-producer")
+        with authority.AuthorityServer(self.owner) as server:
+            launcher = authority.ProducerClient(server.socket_path)
+            params = {"owner_key": self.owner.owner_key, "task_id": "task"}
+            first = launcher.request("resume", params, request_id="one-resume")
+            second = launcher.request("resume", params, request_id="one-resume")
+            self.assertEqual(first["generation"], second["generation"])
+            self.assertTrue(first == second, "same owner request must return identical credential, not rotate")
+            with self.assertRaises(authority.AuthorityError):
+                launcher.request("resume", dict(params, task_id="other"), request_id="one-resume")
+            register = {"owner_key": self.owner.owner_key, "task_id": "new-task", "producer_id": "fixture", "grace_seconds": 1}
+            created = launcher.request("register", register, request_id="one-register")
+            duplicate = launcher.request("register", register, request_id="one-register")
+            self.assertTrue(created == duplicate, "register replay must return original credential")
+            for path in (self.path / "control").iterdir():
+                if path.is_file():
+                    raw = path.read_bytes()
+                    self.assertFalse(first["token"].encode() in raw, "producer token persisted")
+                    self.assertFalse(self.owner.owner_key.encode() in raw, "owner capability persisted")
+
+    def test_bad_lease_timestamp_has_bounded_protocol_refusal_without_traceback(self):
+        import contextlib
+        import io
+        stderr = io.StringIO()
+        artifact = self.call("write", data=b"keep", artifact_class="temp", disposable=True)
+        with contextlib.redirect_stderr(stderr), authority.AuthorityServer(self.owner) as server:
+            for timestamp in ("not a timestamp", True, 17, "99999-01-01T00:00:00Z"):
+                client = authority.ProducerClient(server.socket_path, self.creds)
+                with self.assertRaises(authority.AuthorityError) as caught:
+                    client.lease(artifact, expires_at=timestamp)
+                self.assertEqual(caught.exception.code, "invalid_timestamp")
+                self.assertIsNone(client.pending_request)
+        self.assertFalse(stderr.getvalue(), "server logged an unhandled input traceback")
+        self.assertEqual(self.owner.snapshot("task")["leases"], [])
+
     def test_shared_flock_alone_is_not_a_thread_mutex_control(self):
         path = Path(self.temp.name) / "control-lock"
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)

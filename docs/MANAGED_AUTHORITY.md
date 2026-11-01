@@ -53,6 +53,13 @@ owner-resumed producer may release its own previous-generation claims.
 The registry stores content digests and bounded outcomes, never artifact READ
 bytes or WRITE bodies. Read replay reauthorizes and reads the still-live object;
 it cannot retrieve a retired object's payload from a persistent response cache.
+Owner register/resume request keys bind their complete payload and replay the
+original generation without rotation. A domain-separated HMAC derives the same
+producer capability from the authenticated owner secret, store, request and
+generation; only capability hashes and bounded non-secret receipts persist.
+Control format 2 refuses earlier development stores rather than silently
+retaining or migrating their former payload cache. The socket protocol stays
+version 1. Unknown old stores remain retained for explicit owner inspection.
 Unknown client delivery blocks automatic replay; no endpoint is guessed.
 
 ## Fence and durable retirement

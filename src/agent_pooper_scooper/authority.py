@@ -34,6 +34,7 @@ MAX_BYTES = 512 * 1024
 MAX_FRAME = 1024 * 1024
 MAX_OBJECTS = 1024
 MAX_FENCE_SECONDS = 30
+CONTROL_VERSION = 2
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -65,7 +66,10 @@ def _iso(value=None):
 
 
 def _seconds(value):
-    return schema.parse_timestamp(value).timestamp()
+    parsed = schema.parse_timestamp(value) if isinstance(value, str) else None
+    if parsed is None:
+        raise AuthorityError("invalid_timestamp")
+    return parsed.timestamp()
 
 
 def _json(value):
@@ -159,7 +163,7 @@ class ManagedAuthority:
                     owner_key = secrets.token_urlsafe(32)
                     st, dst = os.fstat(root), os.fstat(data)
                     lock = os.stat("lock", dir_fd=control, follow_symlinks=False)
-                    state = {"schema_version": 1, "store_id": uuid.uuid4().hex,
+                    state = {"schema_version": CONTROL_VERSION, "store_id": uuid.uuid4().hex,
                              "broker_epoch": uuid.uuid4().hex, "revision": 0,
                              "owner_hash": _secret_hash(owner_key), "store_identity": [st.st_dev, st.st_ino],
                              "lock_identity": [lock.st_dev, lock.st_ino],
@@ -241,6 +245,8 @@ class ManagedAuthority:
             os.close(parent)
         # Immutable bootstrap authenticates BEFORE SQLite can recover/write.
         header = self._header()
+        if header.get("schema_version") != CONTROL_VERSION:
+            raise AuthorityError("unsupported_store_control_version")
         if (not hmac.compare_digest(header["owner_hash"], _secret_hash(owner_key))
                 or tuple(header["store_identity"]) != self._store_identity
                 or tuple(header["registry_identity"]) != self._registry_identity):
@@ -357,33 +363,59 @@ class ManagedAuthority:
         if state["recovery_required"]:
             raise AuthorityError("RECOVERY_REQUIRED")
 
-    def register(self, task_id, producer_id, grace_seconds=1, *, deadline=None):
+    def _credential(self, state, receipt, payload_hash, cache_key):
+        # Reconstruct the SAME bounded capability without storing it in SQLite.
+        material = {"domain": "aps-producer-v1", "store_id": state["store_id"],
+                    "request": cache_key, "payload_hash": payload_hash, "receipt": receipt}
+        token = hmac.new(self.owner_key.encode(), _json(material).encode(), hashlib.sha256).hexdigest()
+        return dict(receipt, token=token)
+
+    @staticmethod
+    def _owner_replay(conn, cache_key, payload_hash):
+        old = conn.execute("SELECT hash,result FROM requests WHERE id=?", (cache_key,)).fetchone()
+        if old and old[0] != payload_hash:
+            raise AuthorityError("idempotency_payload_changed")
+        return _strict_json(old[1]) if old else None
+
+    def register(self, task_id, producer_id, grace_seconds=1, *, deadline=None, request_id=None):
         _id(task_id); _id(producer_id)
+        cache_key = "owner:" + _id(request_id or uuid.uuid4().hex)
+        payload_hash = _hash({"method": "register", "task_id": task_id, "producer_id": producer_id, "grace_seconds": grace_seconds})
         if type(grace_seconds) is not int or not 1 <= grace_seconds <= 365 * 86400:
             raise AuthorityError("invalid_grace")
         with self._locked(deadline) as (conn, state, root, deadline):
             self._gate(state)
+            replay = self._owner_replay(conn, cache_key, payload_hash)
+            if replay:
+                return self._credential(state, replay, payload_hash, cache_key)
             if task_id in state["tasks"] or len(state["tasks"]) >= MAX_OBJECTS:
                 raise AuthorityError("task_exists_or_capacity")
-            token = secrets.token_urlsafe(32)
+            receipt = {"task_id": task_id, "producer_id": producer_id, "generation": 1}
+            credential = self._credential(state, receipt, payload_hash, cache_key)
             state["tasks"][task_id] = {"producer_id": producer_id, "generation": 1,
-                                       "token_hash": _secret_hash(token), "status": "active",
+                                       "token_hash": _secret_hash(credential["token"]), "status": "active",
                                        "terminal_at": None, "grace_seconds": grace_seconds}
             state["revision"] += 1
-            self._commit(conn, state)
-            return {"task_id": task_id, "producer_id": producer_id, "generation": 1, "token": token}
+            self._commit(conn, state, [("INSERT INTO requests VALUES(?,?,?)", (cache_key, payload_hash, _json(receipt)))])
+            return credential
 
-    def resume(self, task_id, *, deadline=None):
+    def resume(self, task_id, *, deadline=None, request_id=None):
+        cache_key = "owner:" + _id(request_id or uuid.uuid4().hex)
+        payload_hash = _hash({"method": "resume", "task_id": task_id})
         with self._locked(deadline) as (conn, state, root, deadline):
             self._gate(state)
+            replay = self._owner_replay(conn, cache_key, payload_hash)
+            if replay:
+                return self._credential(state, replay, payload_hash, cache_key)
             task = state["tasks"].get(_id(task_id))
             if task is None:
                 raise AuthorityError("unknown_task")
-            token = secrets.token_urlsafe(32)
-            task.update(generation=task["generation"] + 1, status="active", terminal_at=None, token_hash=_secret_hash(token))
+            receipt = {"task_id": task_id, "producer_id": task["producer_id"], "generation": task["generation"] + 1}
+            credential = self._credential(state, receipt, payload_hash, cache_key)
+            task.update(generation=receipt["generation"], status="active", terminal_at=None, token_hash=_secret_hash(credential["token"]))
             state["revision"] += 1
-            self._commit(conn, state)
-            return {"task_id": task_id, "producer_id": task["producer_id"], "generation": task["generation"], "token": token}
+            self._commit(conn, state, [("INSERT INTO requests VALUES(?,?,?)", (cache_key, payload_hash, _json(receipt)))])
+            return credential
 
     @staticmethod
     def _task(state, credentials):
@@ -406,6 +438,7 @@ class ManagedAuthority:
 
     def producer_call(self, credentials, method, params, request_id=None, deadline=None):
         request_id = _id(request_id or uuid.uuid4().hex)
+        cache_key = "producer:" + request_id
         if not isinstance(params, dict):
             raise AuthorityError("invalid_request")
         params = dict(params)
@@ -414,7 +447,7 @@ class ManagedAuthority:
         payload_hash = _hash({"credentials": credentials, "method": method, "params": params})
         with self._locked(deadline) as (conn, state, root, limit):
             self._gate(state)
-            old = conn.execute("SELECT hash,result FROM requests WHERE id=?", (request_id,)).fetchone()
+            old = conn.execute("SELECT hash,result FROM requests WHERE id=?", (cache_key,)).fetchone()
             if old:
                 if old[0] != payload_hash:
                     raise AuthorityError("idempotency_payload_changed")
@@ -529,7 +562,7 @@ class ManagedAuthority:
                 result, extra = {"status": "active"}, []
             state["revision"] += 1
             if not old:
-                extra.append(("INSERT INTO requests VALUES(?,?,?)", (request_id, payload_hash, _json(result))))
+                extra.append(("INSERT INTO requests VALUES(?,?,?)", (cache_key, payload_hash, _json(result))))
             self._commit(conn, state, extra)
             return data if method == "read" else result
 
@@ -792,9 +825,9 @@ class AuthorityServer:
                         if not isinstance(params, dict) or not hmac.compare_digest(_secret_hash(params.get("owner_key")), _secret_hash(outer.authority.owner_key)):
                             raise AuthorityError("owner_capability_refused")
                         if method == "register":
-                            result = outer.authority.register(params.get("task_id"), params.get("producer_id"), params.get("grace_seconds", 1), deadline=time.monotonic() + budget)
+                            result = outer.authority.register(params.get("task_id"), params.get("producer_id"), params.get("grace_seconds", 1), deadline=time.monotonic() + budget, request_id=request["request_id"])
                         else:
-                            result = outer.authority.resume(params.get("task_id"), deadline=time.monotonic() + budget)
+                            result = outer.authority.resume(params.get("task_id"), deadline=time.monotonic() + budget, request_id=request["request_id"])
                     else:
                         result = outer.authority.producer_call(request["credentials"], method, params,
                                                                request["request_id"], time.monotonic() + budget)
@@ -803,8 +836,8 @@ class AuthorityServer:
                     response = {"ok": True, "result": result}
                 except AuthorityError as exc:
                     response = {"ok": False, "error": exc.code}
-                except (OSError, ValueError, TypeError, KeyError):
-                    response = {"ok": False, "error": "broker_request_unavailable"}
+                except Exception:
+                    response = {"ok": False, "error": "producer_outcome_unknown"}
                 try:
                     self.wfile.write((_json(response) + "\n").encode())
                 except OSError:
@@ -887,7 +920,10 @@ class ProducerClient:
                 self.pending_request = request_id
             raise AuthorityError("producer_outcome_unknown" if sent else "broker_unavailable") from None
         if not result.get("ok"):
-            raise AuthorityError(result.get("error", "broker_refused"))
+            code = result.get("error", "broker_refused")
+            if code in ("producer_outcome_unknown", "authority_storage_unavailable", "producer_effect_deadline_recovery_required"):
+                self.pending_request = request_id
+            raise AuthorityError(code)
         return result["result"]
 
     @classmethod
