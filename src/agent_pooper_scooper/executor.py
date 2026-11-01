@@ -358,8 +358,8 @@ def _fresh(fence, plan):
 
 
 def _collection_operation(operation_id):
-    if _ID.check(operation_id, "operation") or operation_id.startswith("producer:"):
-        raise ExecutionRefused("collection operation ID is invalid or reserved for producer writes")
+    if _ID.check(operation_id, "operation") or operation_id.startswith(("producer:", "owner:")):
+        raise ExecutionRefused("collection operation ID is invalid or uses a reserved authority domain")
     return operation_id
 
 

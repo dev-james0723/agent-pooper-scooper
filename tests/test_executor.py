@@ -146,6 +146,12 @@ class ManagedApiBoundary(unittest.TestCase):
         self.assertFalse(identity["anyOf"][1]["additionalProperties"])
         self.assertEqual(set(identity["anyOf"][1]["required"]), set(executor._REGISTERED_IDENTITY))
 
+    def test_collection_keys_exclude_owner_and_producer_domains(self):
+        for operation in ("producer:reserved", "owner:reserved", "", None, True):
+            with self.subTest(operation=operation), self.assertRaises(executor.ExecutionRefused):
+                executor._collection_operation(operation)
+        self.assertEqual(executor._collection_operation("collection:fixture-1"), "collection:fixture-1")
+
     def test_plan_loader_rejects_duplicate_nonfinite_unknown_and_oversize(self):
         for text in ('{"schema":1,"schema":2}', '{"schema":NaN}', '{"unknown":true}',
                      " " * (executor.MAX_PLAN_BYTES + 1)):
