@@ -60,6 +60,11 @@ CLI implements it. The configured program must perform the real authorized
 tool call. JSON input is limited to 8 KiB, response to 1 MiB, stderr to 16 KiB,
 and waiting to the configured bound. Raw command output and provider diagnostics
 are not stored in the public observation or delivery receipt.
+One monotonic budget starts before request emission and covers nonblocking
+write readiness, response reading and child waiting. Ordinary full pipes cannot
+block a request before the deadline is considered. All owned child streams are
+closed; a killed child can be explicitly reaped asynchronously rather than
+extending the caller's expired budget or relying on garbage collection.
 
 `StdioToolTransport(reader=None, writer=None, timeout=30)` is a supervised
 request/response callback for an existing MCP host. It emits one bounded line:
@@ -80,6 +85,10 @@ The nonce binds the response; malformed, oversized, incomplete and mismatched
 responses fail unknown. The deadline applies after first-byte readiness too;
 a peer cannot keep a partial JSON line open indefinitely. This bridge does not
 install software, introduce a remote endpoint or grant additional effects.
+Non-descriptor fallback is restricted to the exact bounded `io.StringIO` memory
+stream; arbitrary blocking file-like readers are refused. Native status/state
+values must be strings before lookup. Matching identities with malformed lists
+or objects yield redacted unknown observations, never exceptions or authority.
 
 ## Durable Scoop Report notifications
 

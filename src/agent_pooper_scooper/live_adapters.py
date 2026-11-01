@@ -5,11 +5,13 @@ its documented tool-call callback, or an explicitly configured APS JSON bridge.
 Notifications persist intent before dispatch; ambiguous effects are not retried.
 """
 import json
+import io
 import math
 import os
 import selectors
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -32,6 +34,36 @@ def _timeout(value):
     return value
 
 
+def _write_request(writer, payload, deadline):
+    """Ordinary pipe backpressure shares the response's monotonic budget."""
+    if type(writer) is io.StringIO:
+        if time.monotonic() >= deadline: raise LiveAdapterError("transport_outcome_unknown")
+        writer.write(payload.decode())
+        return
+    try:
+        fd = writer.fileno()
+    except (OSError, AttributeError):
+        raise LiveAdapterError("unsupported_transport_stream") from None
+    previous = os.get_blocking(fd)
+    try:
+        os.set_blocking(fd, False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_WRITE)
+            pending = memoryview(payload)
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise LiveAdapterError("transport_outcome_unknown")
+                try:
+                    count = os.write(fd, pending)
+                except BlockingIOError:
+                    continue
+                if count <= 0: raise LiveAdapterError("transport_outcome_unknown")
+                pending = pending[count:]
+    finally:
+        os.set_blocking(fd, previous)
+
+
 def _run_json(argv, *, timeout=5, input_value=None):
     """Bound a child we start; never invoke a shell or store its raw output."""
     _timeout(timeout)
@@ -44,17 +76,18 @@ def _run_json(argv, *, timeout=5, input_value=None):
     failure = None
     result = None
     selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + timeout
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE if payload else subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
         if payload:
-            process.stdin.write(payload); process.stdin.close()
+            _write_request(process.stdin, payload, deadline)
+            process.stdin.close()
         streams = {"stdout": bytearray(), "stderr": bytearray()}
         for name in streams:
             stream = getattr(process, name)
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
-        deadline = time.monotonic() + timeout
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -70,7 +103,7 @@ def _run_json(argv, *, timeout=5, input_value=None):
                 streams[key.data].extend(chunk)
                 if len(streams[key.data]) > (MAX_RESPONSE if key.data == "stdout" else 16384):
                     raise LiveAdapterError("transport_response_unbounded")
-        process.wait(timeout=max(.001, deadline - time.monotonic()))
+        process.wait(timeout=max(0, deadline - time.monotonic()))
         if process.returncode:
             raise LiveAdapterError("transport_outcome_unknown")
         result = authority._strict_json(streams["stdout"].decode())
@@ -86,11 +119,14 @@ def _run_json(argv, *, timeout=5, input_value=None):
             if process.poll() is None:
                 process.kill()  # Only this explicitly started bridge/query child.
             try:
-                process.wait(timeout=1)
+                process.wait(timeout=min(.1, max(0, deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 failure = "transport_outcome_unknown"
-            for stream in (process.stdout, process.stderr):
-                if stream is not None: stream.close()
+                # Explicitly reap only our killed child, without an unbounded
+                # wait in the caller or depending on nondeterministic GC.
+                threading.Thread(target=process.wait, daemon=True).start()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed: stream.close()
     if failure:
         raise LiveAdapterError(failure)
     return result
@@ -122,20 +158,23 @@ class StdioToolTransport:
     def __call__(self, tool, arguments):
         if tool not in TOOLS or not isinstance(arguments, dict):
             raise LiveAdapterError("unsupported_tool")
+        deadline = time.monotonic() + self.timeout
         nonce = uuid.uuid4().hex
         request = authority._json({"type": "aps_tool_call", "request_id": nonce, "tool": tool, "arguments": arguments})
         if len(request.encode()) > 8192:
             raise LiveAdapterError("tool_request_too_large")
-        self.writer.write(request + "\n"); self.writer.flush()
         try:
             fd = self.reader.fileno()
         except (OSError, AttributeError):
-            fd = None  # Only useful for bounded in-memory test streams.
+            if type(self.reader) is not io.StringIO:
+                raise LiveAdapterError("unsupported_transport_stream") from None
+            fd = None
+        _write_request(self.writer, (request + "\n").encode(), deadline)
         failure = None
         response = None
         try:
             if fd is not None:
-                data = bytearray(); deadline = time.monotonic() + self.timeout
+                data = bytearray()
                 with selectors.DefaultSelector() as selector:
                     selector.register(fd, selectors.EVENT_READ)
                     while not data.endswith(b"\n"):
@@ -148,6 +187,7 @@ class StdioToolTransport:
                         if len(data) > MAX_RESPONSE: raise ValueError("bridge frame too large")
                 line = data.decode()
             else:
+                if time.monotonic() >= deadline: raise ValueError("bridge deadline")
                 line = self.reader.readline(MAX_RESPONSE + 1)
             if len(line.encode()) > MAX_RESPONSE or not line.endswith("\n"):
                 raise ValueError("invalid bridge frame")
@@ -182,6 +222,8 @@ class AoSessionAdapter:
         session = answer.get("session") if isinstance(answer, dict) else None
         if not isinstance(session, dict) or session.get("id") != self.session_id or session.get("projectId") != self.project_id:
             return _observation("ao", reason="identity_unverified")
+        if not isinstance(session.get("status"), str):
+            return _observation("ao", verified=True, reason="malformed_native_state")
         status = {"working": "active", "idle": "idle", "waiting": "waiting", "stuck": "blocked"}.get(session.get("status"), "unknown")
         if session.get("isTerminated") is True:
             status = "terminal_observed"
@@ -212,6 +254,8 @@ class KynloStateAdapter:
         data = self._call("get_mission", {"missionId": self.mission_id, "metricsOnly": False})
         if not data or data.get("id") != self.mission_id or data.get("deviceId") != self.device_id:
             return _observation("kynlo", reason="mission_binding_unverified")
+        if not isinstance(data.get("state"), str):
+            return _observation("kynlo", verified=True, reason="malformed_native_state")
         status = {"running": "active", "paused": "paused", "blocked": "blocked", "completed": "terminal_observed", "failed": "terminal_observed"}.get(data.get("state"), "unknown")
         return _observation("kynlo", status, verified=True, reason="observed_not_authority")
 
@@ -222,6 +266,8 @@ class KynloStateAdapter:
         session = data.get("session", data) if data else None
         if not isinstance(session, dict) or session.get("deviceId") != self.device_id or session.get("handle") != self.handle:
             return _observation("kynlo", reason="agent_binding_unverified")
+        if not isinstance(session.get("state"), str):
+            return _observation("kynlo", verified=True, reason="malformed_native_state")
         status = {"running": "active", "idle": "idle", "blocked": "blocked", "completed": "terminal_observed", "failed": "terminal_observed", "stopped": "terminal_observed"}.get(session.get("state"), "unknown")
         return _observation("kynlo", status, verified=True, reason="observed_not_authority")
 

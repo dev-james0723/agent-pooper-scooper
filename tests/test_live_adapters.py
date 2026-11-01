@@ -28,6 +28,30 @@ def partial_stdio_response(queue):
         os.close(wfd); reader.close()
 
 
+def full_stdio_request(queue):
+    rfd, wfd = os.pipe()
+    rr, rw = os.pipe()
+    writer = os.fdopen(wfd, "w")
+    reader = os.fdopen(rr, "r")
+    try:
+        os.set_blocking(wfd, False)
+        try:
+            while True: os.write(wfd, b"x" * 4096)
+        except BlockingIOError: pass
+        os.set_blocking(wfd, True)
+        try:
+            live.StdioToolTransport(reader=reader, writer=writer, timeout=.1)("get_mission", {})
+            queue.put("BAD")
+        except live.LiveAdapterError as exc: queue.put(exc.code)
+    finally:
+        for fd in (rfd, wfd, rr, rw):
+            try: os.close(fd)
+            except OSError: pass
+        for stream in (writer, reader):
+            try: stream.close()
+            except OSError: pass
+
+
 class LiveAdapterTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="aps-live-", dir="/private/tmp" if sys.platform == "darwin" else None)
@@ -142,6 +166,30 @@ class LiveAdapterTests(unittest.TestCase):
             self.assertEqual(queue.get(timeout=.5), "transport_outcome_unknown")
         finally:
             if child.is_alive(): child.terminate(); child.join(1)
+
+    def test_full_request_pipe_obeys_same_total_deadline(self):
+        ctx = multiprocessing.get_context("spawn"); queue = ctx.Queue()
+        child = ctx.Process(target=full_stdio_request, args=(queue,)); child.start()
+        try:
+            child.join(1.5)
+            self.assertFalse(child.is_alive(), "full request pipe blocked before timeout")
+            self.assertEqual(queue.get(timeout=.5), "transport_outcome_unknown")
+        finally:
+            if child.is_alive(): child.terminate(); child.join(1)
+
+    def test_matching_identity_malformed_states_are_unknown_and_private(self):
+        for state in (["private-state", str(self.base)], {"private": str(self.base)}):
+            answers = [
+                live.AoSessionAdapter("fixture-session", "fixture-project", runner=lambda *a, **k: {"session": {"id": "fixture-session", "projectId": "fixture-project", "status": state}}).observe,
+                live.KynloStateAdapter(lambda *a: {"structuredContent": {"id": "fixture-mission", "deviceId": "fixture-device", "state": state}}, "fixture-device", "fixture-mission").observe_mission,
+                live.KynloStateAdapter(lambda *a: {"structuredContent": {"session": {"handle": "fixture-handle", "deviceId": "fixture-device", "state": state}}}, "fixture-device", "fixture-mission", handle="fixture-handle").observe_agent,
+            ]
+            for observe in answers:
+                with self.subTest(state_type=type(state).__name__):
+                    result = observe()
+                    self.assertEqual(result["status"], "unknown")
+                    self.assertFalse(result["can_authorize_cleanup"])
+                    self.assertFalse(str(self.base) in json.dumps(result))
 
     def test_mission_observation_matches_actual_top_level_contract_and_is_redacted(self):
         def call(name, args):
