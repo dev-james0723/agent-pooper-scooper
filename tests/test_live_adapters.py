@@ -81,6 +81,44 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertIn("17", params["message"])
         self.assertNotIn("fixture-device", json.dumps(receipt))
 
+    def managed_history(self, *, unknown=False):
+        return {"schema": "agent-pooper-scooper/managed-report", "schema_version": 1,
+                "mode": "read-only-accounting", "complete": not unknown,
+                "removed": {"scope": "cumulative_confirmed_receipts", "count": 0 if unknown else 1,
+                            "known_bytes": 0 if unknown else 58, "bytes": None if unknown else 58,
+                            "unknown_count": 1 if unknown else 0,
+                            "qualification": "private untrusted wording " + str(self.base)}}
+
+    def test_collector_notice_literal_remains_unchanged(self):
+        projection, message = live._notice({"removed": {"count": 1, "bytes": 58}}, True)
+        self.assertEqual(message, "TEST: synthetic fixture only. Scoop Report: removed 1 files / 58 logical bytes. Reclaimed capacity unknown.")
+        self.assertEqual(projection, {"removed_count": 1, "removed_bytes": 58})
+
+    def test_cumulative_reports_remain_historical_for_distinct_notice_keys(self):
+        report = self.managed_history()
+        notifier = self.notifier(self.ack)
+        notifier.send("history-one", report); notifier.send("history-two", copy.deepcopy(report))
+        self.assertEqual(len(self.calls), 2)
+        for _, params in self.calls:
+            message = params["message"]
+            self.assertIn("cumulative confirmed removal history", message)
+            self.assertIn("58 known logical bytes", message)
+            self.assertIn("confirmed lower bound", message)
+            self.assertIn("no new removals by this report", message)
+            self.assertFalse(str(self.base) in message)
+
+    def test_cumulative_unknown_bytes_and_scope_are_bound_in_message(self):
+        projection, message = live._notice(self.managed_history(unknown=True), False)
+        self.assertIn("0 known logical bytes", message)
+        self.assertIn("Uncertain historical outcomes: 1", message)
+        self.assertIn("total historical removed bytes unknown", message)
+        self.assertEqual(projection["removal_scope"], "cumulative_confirmed_receipts")
+        notifier = self.notifier(self.ack)
+        notifier.send("scope-binding", {"removed": {"count": 1, "bytes": 58}})
+        with self.assertRaises(live.LiveAdapterError):
+            notifier.send("scope-binding", self.managed_history())
+        self.assertEqual(len(self.calls), 1)
+
     def test_notification_same_key_does_not_dispatch_again_after_reopen(self):
         first = self.notifier(self.ack).send("notice", self.report)
         owner = authority.ManagedAuthority(self.owner.path, owner_key=self.owner.owner_key)

@@ -288,7 +288,23 @@ def _notice(report, test_mode):
     count, size = _count(removed, "count"), _count(removed, "bytes", nullable=True)
     projection = {"removed_count": count, "removed_bytes": size}
     message = ("TEST: synthetic fixture only. " if test_mode else "")
-    message += f"Scoop Report: removed {count} files / {size if size is not None else 'unknown'} logical bytes. "
+    historical = (report.get("schema") == "agent-pooper-scooper/managed-report"
+                  or removed.get("scope") == "cumulative_confirmed_receipts")
+    if historical:
+        if (report.get("schema") != "agent-pooper-scooper/managed-report" or type(report.get("schema_version")) is not int
+                or report["schema_version"] != 1 or report.get("mode") != "read-only-accounting"
+                or removed.get("scope") != "cumulative_confirmed_receipts"):
+            raise LiveAdapterError("invalid_report_accounting")
+        known, uncertain = _count(removed, "known_bytes"), _count(removed, "unknown_count")
+        if size is not None and size != known:
+            raise LiveAdapterError("invalid_report_accounting")
+        projection.update(removal_scope="cumulative_confirmed_receipts", known_removed_bytes=known, unknown_removal_count=uncertain)
+        message += f"Scoop Report: cumulative confirmed removal history: {count} files / {known} known logical bytes. "
+        message += "Historical confirmed lower bound; no new removals by this report. "
+        if size is None or uncertain:
+            message += f"Uncertain historical outcomes: {uncertain}; total historical removed bytes unknown. "
+    else:
+        message += f"Scoop Report: removed {count} files / {size if size is not None else 'unknown'} logical bytes. "
     eligible = report.get("eligible", report.get("candidate"))
     if eligible is not None:
         if not isinstance(eligible, dict): raise LiveAdapterError("invalid_report_accounting")

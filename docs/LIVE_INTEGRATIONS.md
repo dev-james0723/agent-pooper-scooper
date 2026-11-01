@@ -104,6 +104,13 @@ integers, with bytes optionally null for unknown). An optional `eligible` or
 projection creates the message. Filenames, task/producer labels, paths,
 host/device/session identifiers, unknown fields and exception details do not
 enter its text. Reclaimed capacity is always described as unknown.
+Managed read-only reports are distinguished by their versioned schema/mode and
+`cumulative_confirmed_receipts` scope. Their fixed message explicitly describes
+cumulative confirmed history, known lower-bound bytes and no new removals by the
+report. Unknown historical bytes retain an unknown-total statement and bounded
+uncertain-outcome count. Free-text qualification fields are never forwarded.
+Scope and these numeric facts enter the message and therefore its existing
+outbox payload binding; collector-invocation wording stays unchanged.
 
 The target device/mission is configured separately and sent only as routing
 metadata. Test mode uses a fixed TEST title and synthetic-fixture label; no
