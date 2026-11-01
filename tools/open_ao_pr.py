@@ -24,7 +24,7 @@ EXPECTED_REMOTE = "dev-james0723/agent-pooper-scooper"
 PUSH_URL = f"https://github.com/{EXPECTED_REMOTE}.git"
 APPROVED_URLS = {PUSH_URL, PUSH_URL.removesuffix(".git"),
                  f"git@github.com:{EXPECTED_REMOTE}.git"}
-BRANCH_PATTERN = re.compile(r"^(?:ao|chore|feat|fix|docs)/[a-z0-9][a-z0-9._/-]*$")
+BRANCH_PATTERN = re.compile(r"^(?:ao|chore|feat|fix|docs)/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 PR_FIELDS = ("number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
              "isCrossRepository,headRepositoryOwner,headRepository")

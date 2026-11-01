@@ -393,7 +393,7 @@ class PostTestRecheckTests(PublisherTestCase):
         self.assertRefused("fast-forward")
 
     def test_local_branch_can_differ_from_explicit_pr_branch(self):
-        self.repo.git("switch", "-q", "-c", "fix/reviewed-candidate")
+        self.repo.git("switch", "-q", "-c", "fix/MixedCase-reviewed-candidate")
         code, out, err = self.publish("--publish")
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.world.pushes[0]["spec"], f"{self.head}:refs/heads/{BRANCH}")
