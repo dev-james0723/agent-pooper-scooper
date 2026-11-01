@@ -516,6 +516,15 @@ class WorkflowTests(GateTestCase):
         self.assertEqual(set(matrix["os"]), {"ubuntu-latest", "macos-latest"})
         self.assertEqual(set(matrix["python"]), {"3.10", "3.15"})
 
+    def test_packaging_temp_context_is_scoped_to_steps(self):
+        workflow = parse_workflow((REPO_ROOT / ".github/workflows/ci.yml").read_text())
+        package = workflow["jobs"]["package"]
+        self.assertNotIn("runner.", str(package.get("env", {})))
+        steps = {step.get("name"): step for step in package["steps"]}
+        for name in ("Build sdist and wheel from sdist", "Install offline and verify installed CLI"):
+            with self.subTest(step=name):
+                self.assertEqual(steps[name]["env"]["APS_DIST_DIR"], "${{ runner.temp }}/aps-dist")
+
 
 if __name__ == "__main__":
     unittest.main()

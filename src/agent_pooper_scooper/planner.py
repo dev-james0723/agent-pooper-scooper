@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from pathlib import PurePosixPath
 import stat
 
 from . import adapters, disk, events, schema
@@ -181,11 +182,15 @@ def _build_plan(manifest, adapter=None, *, now=None, task_events=None, public=Fa
             if meta and (meta["mtime_ns"] > schema.parse_timestamp(evidence["observed_at"]).timestamp() * 1e9
                          or meta["ctime_ns"] > schema.parse_timestamp(evidence["observed_at"]).timestamp() * 1e9):
                 reasons.append("root_changed_after_evidence")
+    retained_paths = {artifact["path"] for artifact in manifest["artifacts"]
+                      if artifact["class"] in schema.PROTECTED_CLASSES or not artifact["disposable"]}
     decisions, states = [], []
     for artifact in manifest["artifacts"]:
         reasons = list(global_reasons)
         if artifact["class"] in schema.PROTECTED_CLASSES or not artifact["disposable"]:
             reasons.append("protected_or_not_disposable")
+        if any(str(parent) in retained_paths for parent in PurePosixPath(artifact["path"]).parents):
+            reasons.append("inside_retained_artifact")
         containing = [r for r in manifest["roots"] if artifact["path"] != r["path"]
                       and _within(artifact["path"], r["path"])]
         root = max(containing, key=lambda r: len(r["path"])) if containing else None

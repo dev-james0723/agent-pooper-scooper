@@ -38,6 +38,12 @@ class InstalledCliSmoke(unittest.TestCase):
             run("manifest", "init", path, "--task-id", "private-task", "--host", "private-host",
                 "--producer", "fixture", "--root", root)
             run("manifest", "record", path, target, "--class", "temp", "--disposable")
+            history = root / "private-history"
+            history.mkdir()
+            protected_child = history / "output.log"
+            protected_child.write_bytes(b"retained history")
+            run("manifest", "record", path, protected_child, "--class", "log", "--disposable")
+            run("manifest", "record", path, history, "--class", "session-history")
             self.assertEqual(json.loads(run("plan", path))["candidate"]["count"], 0)
             self.assertEqual(json.loads(run("plan", path, "--execute", expected=1))["execution"]["status"], "BLOCKED")
             document = json.loads(path.read_text(encoding="utf-8"))
@@ -59,6 +65,9 @@ class InstalledCliSmoke(unittest.TestCase):
             evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
             plan = json.loads(run("plan", path, "--evidence", evidence_path, "--public"))
             self.assertEqual(plan["candidate"]["apparent_bytes"], 17)
+            inherited = [item for item in plan["decisions"] if "inside_retained_artifact" in item["reasons"]]
+            self.assertEqual(len(inherited), 1)
+            self.assertEqual(inherited[0]["decision"], "KEEP")
             self.assertEqual(plan["execution"]["status"], "BLOCKED")
             self.assertFalse(plan["evidence"]["authenticated"])
             self.assertIsNone(plan["reclaimed"]["bytes"])
@@ -94,6 +103,7 @@ class InstalledCliSmoke(unittest.TestCase):
             linked.symlink_to(event_path)
             run("task-end", path, "--events", linked, "--public", expected=1)
             self.assertEqual(target.read_bytes(), b"p" * 17)
+            self.assertEqual(protected_child.read_bytes(), b"retained history")
 
     def test_installed_observe_only_workflow(self):
         self.assertIsNotNone(APS, "pass the installed aps executable")

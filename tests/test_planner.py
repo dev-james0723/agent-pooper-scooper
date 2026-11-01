@@ -83,6 +83,52 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("evidence_unavailable", data["decisions"][0]["reasons"])
         self.assertEqual(data["candidate"]["count"], 0)
 
+    def test_explicit_ancestor_protection_overrides_disposable_children(self):
+        from agent_pooper_scooper import report
+        parent = self.root / "session"
+        parent.mkdir()
+        child = parent / "output.log"
+        child.write_bytes(b"keep me")
+        sibling = self.root / "session-extra"
+        sibling.mkdir()
+        unrelated = sibling / "output.log"
+        unrelated.write_bytes(b"y" * 19)
+        # Record the child first: protection must not depend on manifest order.
+        manifest.record_artifact(self.path, child, artifact_class="log", disposable=True)
+        manifest.record_artifact(self.path, parent, artifact_class="temp", disposable=False)
+        manifest.record_artifact(self.path, unrelated, artifact_class="log", disposable=True)
+        document = manifest.load_manifest(self.path)
+        event = {"schema": schema.TASK_EVENT_SCHEMA, "schema_version": 1, "event_id": "end-1",
+                 "task_id": "task-1", "host": "fixture-host", "producer": "fixture",
+                 "event_type": "task.completed", "occurred_at": self.at(-7200)}
+        for artifact_class in ("session-history", "temp"):
+            for reverse in (False, True):
+                with self.subTest(artifact_class=artifact_class, reverse=reverse):
+                    self.document = copy.deepcopy(document)
+                    for artifact in self.document["artifacts"]:
+                        if artifact["path"] == str(parent):
+                            artifact["class"] = artifact_class
+                    if reverse:
+                        self.document["artifacts"].reverse()
+                    self.evidence["manifest_digest"] = planner.digest_document(self.document)
+                    data = self.plan(task_events=[event])
+                    decisions = {item["path"]: item for item in data["decisions"]}
+                    self.assertEqual(decisions[str(child)]["decision"], "KEEP")
+                    self.assertIn("inside_retained_artifact", decisions[str(child)]["reasons"])
+                    for target in (self.target, unrelated):
+                        self.assertEqual(decisions[str(target)]["decision"], "WOULD_REMOVE")
+                        self.assertEqual(decisions[str(target)]["reasons"], [])
+                    self.assertEqual(data["candidate"]["count"], 2)
+                    self.assertEqual(data["candidate"]["apparent_bytes"], 142)
+                    self.assertEqual(data["execution"]["status"], "BLOCKED")
+                    self.assertTrue(planner.revalidate_plan(
+                        data, self.document, self.adapter(), now=self.now, task_events=[event])["valid"])
+                    linked = report.build_report(self.document, [event], plan=data,
+                                                 evidence_adapter=self.adapter(), now=self.now)
+                    self.assertEqual(linked["eligible"]["apparent_bytes"], 142)
+        self.assertEqual(child.read_bytes(), b"keep me")
+        self.assertEqual(unrelated.read_bytes(), b"y" * 19)
+
     def test_schema_unknown_fields_and_versions_fail_closed(self):
         for mutate in (lambda e: e.update(extra=True), lambda e: e.update(schema_version=2),
                        lambda e: e["approved_roots"][0].update(extra=True),

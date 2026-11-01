@@ -44,8 +44,6 @@ jobs:
         python:
           - '3.10'
           - '3.15'
-    env:
-      APS_DIST_DIR: ${{ runner.temp }}/aps-dist
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -60,11 +58,15 @@ jobs:
       - name: Provision declared build requirements
         run: python3 -m pip install --disable-pip-version-check 'setuptools>=58' wheel
       - name: Build sdist and wheel from sdist
+        env:
+          APS_DIST_DIR: ${{ runner.temp }}/aps-dist
         run: |
           mkdir -p "$APS_DIST_DIR"
           python3 -c "import os, setuptools.build_meta as backend; backend.build_sdist(os.environ['APS_DIST_DIR'])"
           python3 -m pip wheel --no-index --no-deps --no-build-isolation "$APS_DIST_DIR/"*.tar.gz --wheel-dir "$APS_DIST_DIR"
       - name: Install offline and verify installed CLI
+        env:
+          APS_DIST_DIR: ${{ runner.temp }}/aps-dist
         run: |
           python3 -m venv "$RUNNER_TEMP/aps-runtime"
           "$RUNNER_TEMP/aps-runtime/bin/python" -m pip install --no-index --no-deps "$APS_DIST_DIR/"*.whl
