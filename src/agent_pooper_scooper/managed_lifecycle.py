@@ -285,12 +285,15 @@ class ManagedTaskCoordinator:
         with self._tx() as conn:
             self._alias(conn, "stage:" + slot.split(":", 1)[0], slot, binding, request_id)
             row = self._get(conn, slot)
+            resume = slot.startswith("resume:")
             # Resume rechecks even a completed replay before entering the broker.
+            # Its immutable binding may name a predecessor workflow, so match
+            # the global precheck rather than filtering by that old binding.
             # New claims of any exclusive phase cannot cross an unknown phase.
-            if exclusive and (row is None or slot.startswith("resume:")):
+            if exclusive and (row is None or resume):
                 for key, in conn.execute("SELECT key FROM records WHERE key NOT LIKE 'alias:%'"):
                     other = self._get(conn, key)
-                    if self._uncertain(other) and other["binding"].get("workflow") == binding.get("workflow"):
+                    if self._uncertain(other) and (resume or other["binding"].get("workflow") == binding.get("workflow")):
                         raise LifecycleError("workflow outcome unknown")
             if row:
                 if row["kind"] != "action" or row["binding"] != binding:

@@ -89,7 +89,9 @@ SQLite phase claims serialize competing callers. Intent commits precede
 invocation, terminal/resume/collection and dispatch. No journal transaction
 spans broker or network calls; no atomicity across databases is claimed.
 Resume atomically rechecks workflow exclusivity when claiming its phase, before
-entering the broker, including a completed-credential replay.
+entering the broker, including a completed-credential replay. This checks all
+pending or unknown phases in the journal, including the current generation;
+the cached predecessor binding and broker replay key stay immutable.
 Unconfirmed stage completion stops mutation and remains inspect-only. A fresh
 request ID, timestamp, grant refresh or replacement journal cannot hide it.
 Underlying authority recovery remains authoritative. Status does not repair

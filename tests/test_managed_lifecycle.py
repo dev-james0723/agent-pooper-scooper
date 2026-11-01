@@ -162,6 +162,60 @@ class ManagedLifecycleTests(unittest.TestCase):
             broker_resume.assert_not_called()
         self.assertEqual(self.owner.snapshot("private-task")["producer_generation"], generation)
 
+    def test_cached_resume_claim_blocks_current_generation_pending_run(self):
+        self.run_task()
+        current = self.coord.resume("private-task", "initial-resume")
+        generation = current.credentials["generation"]
+        resume_entered, resume_release = threading.Event(), threading.Event()
+        producer_entered, producer_release = threading.Event(), threading.Event()
+        resumed, produced = [], []
+        real_claim = self.coord._claim
+        def barrier(slot, *args, **kwargs):
+            if slot.startswith("resume:"):
+                resume_entered.set()
+                if not resume_release.wait(5):
+                    raise RuntimeError("fixture resume barrier expired")
+            return real_claim(slot, *args, **kwargs)
+        def cached_resume():
+            try:
+                resumed.append(self.coord.resume("private-task", "cached-alias"))
+            except Exception as exc:
+                resumed.append(exc)
+        def producer(client):
+            producer_entered.set()
+            if not producer_release.wait(5):
+                raise RuntimeError("fixture producer barrier expired")
+            self.produce(client)
+        other = lifecycle.ManagedTaskCoordinator(self.owner, self.server.socket_path, self.path)
+        def run_current():
+            try:
+                produced.append(other.run_producer(current, producer, "run-current-generation"))
+            except Exception as exc:
+                produced.append(exc)
+        cached = threading.Thread(target=cached_resume)
+        running = threading.Thread(target=run_current)
+        with mock.patch.object(self.coord, "_claim", barrier), mock.patch.object(self.owner, "resume", wraps=self.owner.resume) as broker_resume:
+            cached.start()
+            try:
+                self.assertTrue(resume_entered.wait(2))
+                running.start()
+                self.assertTrue(producer_entered.wait(2))
+                resume_release.set();cached.join(3)
+                self.assertFalse(cached.is_alive())
+                broker_resume.assert_not_called()
+                self.assertEqual(len(resumed), 1)
+                self.assertIsInstance(resumed[0], lifecycle.LifecycleError)
+                self.assertEqual(self.owner.snapshot("private-task")["producer_generation"], generation)
+            finally:
+                resume_release.set();producer_release.set()
+                cached.join(5)
+                if running.ident is not None:
+                    running.join(5)
+        self.assertFalse(running.is_alive())
+        self.assertEqual(len(produced), 1)
+        self.assertIsInstance(produced[0], dict)
+        self.assertEqual(produced[0]["report"]["generated"]["apparent_bytes"], 80)
+
     def test_delivery_slot_pins_target_after_unknown_and_alias_never_resends(self):
         result = self.run_task()
         calls = []
