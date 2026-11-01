@@ -105,6 +105,27 @@ class ManagedReportTests(unittest.TestCase):
         self.assertIsNone(report["removed"]["bytes"])
         self.assertEqual(report["removed"]["count"], 0)
 
+    def test_reconciled_present_retains_unknown_removed_bytes_without_new_unlink(self):
+        plan = executor.create_plan(self.owner, "private-task")
+        grant = executor.approve_plan(self.owner, plan, "prepared-no-unlink")
+        ident = plan["candidate"]["artifact_ids"][0]
+        identity = next(d["identity"] for d in plan["decisions"] if d["artifact_id"] == ident)
+        with self.owner.transaction("private-task", expected_revision=plan["revision"], deadline=time.monotonic() + 3) as fence:
+            fence.prepare("prepared-no-unlink", plan["plan_digest"], ident, identity, grant["approval_id"])
+        with mock.patch.object(os, "unlink", side_effect=AssertionError("report/reconcile must not unlink")):
+            reconciled = self.owner.reconcile("prepared-no-unlink", ident)
+            self.assertEqual(reconciled["outcome"], "reconciled_present")
+            self.assertIsNone(reconciled["removed_bytes"])
+            report = managed_report.build_report(self.owner, "private-task")
+        self.assertEqual(report["removed"]["count"], 0)
+        self.assertEqual(report["removed"]["known_bytes"], 0)
+        self.assertIsNone(report["removed"]["bytes"])
+        self.assertEqual(report["removed"]["unknown_count"], 1)
+        self.assertEqual(report["generated"]["apparent_bytes"], 40)
+        self.assertEqual(report["retained"]["apparent_bytes"], 40)
+        self.assertGreater(report["unknowns"]["count"], 0)
+        self.assertFalse(report["complete"])
+
     def test_caller_receipt_json_and_wrong_capability_cannot_supply_facts(self):
         with self.assertRaises(managed_report.ManagedReportError):
             managed_report.build_report({"removed": {"count": 99, "bytes": 999}}, "private-task")

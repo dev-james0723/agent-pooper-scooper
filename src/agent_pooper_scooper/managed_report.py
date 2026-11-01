@@ -110,7 +110,7 @@ def _build(view):
                 duplicates += 1  # IDs are never reused; count historical effect once.
             else:
                 removed[ident] = dict(outcome, identity=artifact["identity"])
-        elif outcome["outcome"] in ("pending", "unknown", "reconciled_missing"):
+        elif outcome["outcome"] in ("pending", "unknown", "reconciled_missing", "reconciled_present"):
             uncertain_removal.add(ident)
             unknown.add((ident, "removal_causality_unknown"))
     known_created = [item for item in artifacts.values() if item["creation_verified"]]
