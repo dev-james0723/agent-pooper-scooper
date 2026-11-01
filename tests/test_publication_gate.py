@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.publication_gate import safe_relative_path
+from tools.publication_gate import git_env, resolve_commit, safe_relative_path, scan_publication
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE_CLI = REPO_ROOT / "tools" / "publication_gate.py"
@@ -204,6 +204,23 @@ class HistoryScanTests(GateTestCase):
         self.assertGateFails("grafts")
 
 
+class OfflineObjectStoreTests(GateTestCase):
+    def test_partial_clone_refused_before_revision_resolution(self):
+        self.repo.git("config", "extensions.partialClone", "origin")
+        with mock.patch("tools.publication_gate.resolve_commit", wraps=resolve_commit) as resolving:
+            result = scan_publication(self.repo.path)
+        self.assertTrue(any("partial" in p for p in result.problems), result.problems)
+        resolving.assert_not_called()
+
+    def test_promisor_configuration_refused(self):
+        self.repo.git("config", "remote.origin.promisor", "true")
+        self.assertGateFails("promisor")
+
+    def test_lazy_fetch_disabled_despite_environment_override(self):
+        with mock.patch.dict(os.environ, {"GIT_NO_LAZY_FETCH": "0"}):
+            self.assertEqual(git_env().get("GIT_NO_LAZY_FETCH"), "1")
+
+
 class ObjectScanTests(GateTestCase):
     """HIGH-2: committed Git objects and modes are scanned, not the working tree."""
 
@@ -248,6 +265,17 @@ class ObjectScanTests(GateTestCase):
         self.repo.write("docs/blob.md", b"text\x00more")
         self.repo.commit("docs: blob")
         self.assertGateFails("binary")
+
+    def test_missing_historical_blob_fails_closed(self):
+        self.repo.write("docs/lost.md", "historical fixture\n")
+        self.repo.commit("docs: add history")
+        oid = self.repo.git("rev-parse", "HEAD:docs/lost.md")
+        self.repo.remove("docs/lost.md")
+        self.repo.commit("docs: remove history")
+        # Deliberately remove only this fixture's known loose object. There is
+        # no remote or promisor configured, so no command can retrieve it.
+        (self.repo.path / ".git/objects" / oid[:2] / oid[2:]).unlink()
+        self.assertGateFails("fail closed")
 
     def test_empty_forbidden_tree_is_rejected(self):
         empty = self.repo.git("mktree", input=b"")

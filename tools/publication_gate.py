@@ -99,6 +99,7 @@ def git_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS
            and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
     env["GIT_NO_REPLACE_OBJECTS"] = "1"  # read the objects a push really sends
+    env["GIT_NO_LAZY_FETCH"] = "1"  # object inspection must stay offline
     env["GIT_OPTIONAL_LOCKS"] = "0"
     return env
 
@@ -472,7 +473,14 @@ def workflow_problems(path: str, text: str) -> list[str]:
 # --------------------------------------------------------------------------
 # Publication scan
 # --------------------------------------------------------------------------
-def _repository_shape_problems(root: Path) -> list[str]:
+def repository_shape_problems(root: Path) -> list[str]:
+    # Config inspection cannot fetch objects. Refuse partial stores before any
+    # revision/tree/blob lookup, including on Git versions predating the env guard.
+    config = git(root, "config", "--null", "--list", "--includes")
+    for record in config.split(b"\0"):
+        key = record.partition(b"\n")[0].lower()
+        if key == b"extensions.partialclone" or re.fullmatch(rb"remote\..*\.promisor", key):
+            return ["partial/promisor object stores are unsupported; use a full local clone"]
     problems = []
     if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
         problems.append("repository is shallow; full history is required to scan what a push publishes")
@@ -485,6 +493,12 @@ def _repository_shape_problems(root: Path) -> list[str]:
 def scan_publication(root: Path, rev: str = "HEAD",
                      bases: list[str] | tuple[str, ...] = (DEFAULT_BASE,)) -> GateResult:
     result = GateResult()
+    try:
+        result.problems.extend(repository_shape_problems(root))
+    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        result.problems.append(f"could not inspect Git repository (fail closed): {exc}")
+    if result.problems:
+        return result
     sha = resolve_commit(root, rev)
     if sha is None:
         result.problems.append(f"cannot resolve revision {rev!r} in a Git repository")
@@ -501,7 +515,6 @@ def scan_publication(root: Path, rev: str = "HEAD",
     if result.problems:
         return result
     try:
-        result.problems.extend(_repository_shape_problems(root))
         commits = git(root, "rev-list", sha, "--not", *base_shas).decode().split()
         result.commits = len(commits)
         for commit in commits:

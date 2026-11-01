@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from publication_gate import (DEFAULT_BASE, git_env, list_tree, read_blobs,
-                              scan_publication)
+                              repository_shape_problems, scan_publication)
 
 EXPECTED_REMOTE = "dev-james0723/agent-pooper-scooper"
+GH_REPOSITORY = f"github.com/{EXPECTED_REMOTE}"
 PUSH_URL = f"https://github.com/{EXPECTED_REMOTE}.git"
 APPROVED_URLS = {PUSH_URL, PUSH_URL.removesuffix(".git"),
                  f"git@github.com:{EXPECTED_REMOTE}.git"}
@@ -34,7 +35,7 @@ def run(args: list[str], root: Path) -> str:
     env = git_env()
     # gh always uses github.com and the explicit --repo, irrespective of ambient overrides.
     env.pop("GH_REPO", None)
-    env.pop("GH_HOST", None)
+    env["GH_HOST"] = "github.com"
     return subprocess.run(args, cwd=root, capture_output=True, text=True,
                           check=True, env=env).stdout.strip()
 
@@ -43,6 +44,7 @@ def run(args: list[str], root: Path) -> str:
 class LocalState:
     branch: str
     sha: str
+    baseline: str
     config_digest: str
 
 
@@ -54,6 +56,9 @@ def verify_repo(root: Path, expected_sha: str | None) -> LocalState:
     toplevel = Path(run(["git", "rev-parse", "--show-toplevel"], root)).resolve()
     if toplevel != root:
         raise ValueError("Use the root directory of this repository/worktree")
+    problems = repository_shape_problems(root)
+    if problems:
+        raise ValueError("Publication repository refused:\n" + "\n".join(problems))
     for flags, label in (([], "fetch URL"), (["--push"], "push URL")):
         urls = run(["git", "remote", "get-url", *flags, "--all", "origin"], root).splitlines()
         if not urls or any(url not in APPROVED_URLS for url in urls):
@@ -70,7 +75,11 @@ def verify_repo(root: Path, expected_sha: str | None) -> LocalState:
         raise ValueError("HEAD changed or does not equal the exact reviewed SHA")
     if run(["git", "status", "--porcelain", "--untracked-files=all"], root):
         raise ValueError("Working tree is dirty; commit and review exact changes first")
-    return LocalState(branch, sha, hashlib.sha256(config.encode()).hexdigest())
+    baseline = run(["git", "rev-parse", "--verify", "--end-of-options",
+                    DEFAULT_BASE + "^{commit}"], root)
+    if not SHA_PATTERN.fullmatch(baseline):
+        raise ValueError("Cannot capture the exact baseline commit")
+    return LocalState(branch, sha, baseline, hashlib.sha256(config.encode()).hexdigest())
 
 
 def remote_heads(root: Path, branch: str) -> dict[str, str]:
@@ -86,7 +95,7 @@ def remote_heads(root: Path, branch: str) -> dict[str, str]:
 
 
 def gh(root: Path, *args: str) -> str:
-    return run(["gh", "pr", *args, "--repo", EXPECTED_REMOTE], root)
+    return run(["gh", "pr", *args, "--repo", GH_REPOSITORY], root)
 
 
 def verify_pr(root: Path, number: str, branch: str, head: str) -> dict:
@@ -108,12 +117,12 @@ def verify_pr(root: Path, number: str, branch: str, head: str) -> dict:
     return pr
 
 
-def preflight_remote(root: Path, branch: str, sha: str, number: str | None) -> dict[str, str]:
+def preflight_remote(root: Path, branch: str, sha: str, number: str | None,
+                     baseline: str) -> dict[str, str]:
     default = run(["git", "ls-remote", "--symref", PUSH_URL, "HEAD"], root)
     if "ref: refs/heads/main\tHEAD" not in default.splitlines() or branch == "main":
         raise ValueError("Refusing unexpected remote default branch or default branch target")
     heads = remote_heads(root, branch)
-    baseline = run(["git", "rev-parse", "--verify", DEFAULT_BASE], root)
     if heads.get("refs/heads/main") != baseline:
         raise ValueError("Remote main differs from local baseline; fetch and review again")
     old = heads.get(f"refs/heads/{branch}")
@@ -134,8 +143,8 @@ def preflight_remote(root: Path, branch: str, sha: str, number: str | None) -> d
     return heads
 
 
-def check_gate(root: Path, sha: str) -> None:
-    result = scan_publication(root, sha)
+def check_gate(root: Path, sha: str, baseline: str) -> None:
+    result = scan_publication(root, sha, bases=[baseline])
     if result.problems:
         raise ValueError("Publication gate failed:\n" + "\n".join(result.problems))
     print(f"Object gate PASS: {result.files} files, {result.commits} new commit(s), {sha}")
@@ -181,14 +190,18 @@ def main() -> int:
         if (not BRANCH_PATTERN.fullmatch(branch)
                 or run(["git", "check-ref-format", f"refs/heads/{branch}"], root)):
             raise ValueError("Invalid target feature branch")
-        check_gate(root, before.sha)
         number = str(args.pr) if args.pr else None
-        remote_before = preflight_remote(root, branch, before.sha, number) if args.publish else None
+        # Attest the captured exclusion before scanning. Never resolve a mutable
+        # baseline ref again inside the scan or provider comparison.
+        remote_before = (preflight_remote(root, branch, before.sha, number, before.baseline)
+                         if args.publish else None)
+        check_gate(root, before.sha, before.baseline)
         run_snapshot_tests(root, before.sha)
         after = verify_repo(root, before.sha)
         if after != before:
-            raise ValueError("Branch or Git configuration changed during tests")
-        if args.publish and preflight_remote(root, branch, before.sha, number) != remote_before:
+            raise ValueError("Branch, baseline or Git configuration changed during tests")
+        if args.publish and preflight_remote(
+                root, branch, before.sha, number, before.baseline) != remote_before:
             raise ValueError("Remote refs changed during tests; review again")
         print("Local publication checks PASS:", before.sha)
         if not args.publish:

@@ -24,6 +24,7 @@ if str(TOOLS) not in sys.path:
 import open_ao_pr  # noqa: E402  (imported the same way the script runs)
 
 APPROVED = "dev-james0723/agent-pooper-scooper"
+APPROVED_SPEC = f"github.com/{APPROVED}"
 APPROVED_URL = f"https://github.com/{APPROVED}.git"
 BRANCH = "feat/demo"
 HEX40 = set("0123456789abcdef")
@@ -42,6 +43,8 @@ class FakeWorld:
         self.create_as_draft = True
         self.test_root = None
         self.on_push = None
+        self.configured_gh_host = "github.com"
+        self.gh_hosts = []
 
     # -- dispatcher ---------------------------------------------------------
     def run(self, args, root, **kwargs):
@@ -99,6 +102,9 @@ class FakeWorld:
 
     # -- gh simulation -------------------------------------------------------
     def _gh(self, args):
+        spec = args[args.index("--repo") + 1]
+        self.gh_hosts.append(spec.split("/", 1)[0] if spec.count("/") == 2
+                             else self.configured_gh_host)
         sub = args[1:3]
         if sub == ["pr", "list"]:
             head = args[args.index("--head") + 1]
@@ -304,7 +310,27 @@ class DestinationBindingTests(PublisherTestCase):
         self.assertTrue(gh_calls)
         for call in gh_calls:
             self.assertIn("--repo", call, call)
-            self.assertEqual(call[call.index("--repo") + 1], APPROVED, call)
+            self.assertEqual(call[call.index("--repo") + 1], APPROVED_SPEC, call)
+
+    def test_configured_enterprise_host_cannot_redirect_existing_pr_calls(self):
+        self.world.configured_gh_host = "enterprise.example"
+        code, out, err = self.publish("--publish")
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.world.gh_hosts)
+        self.assertEqual(set(self.world.gh_hosts), {"github.com"})
+
+    def test_partial_store_is_refused_before_network(self):
+        self.repo.git("config", "remote.origin.promisor", "true")
+        self.assertRefused("promisor")
+        self.assertEqual(self.world.network_calls(), [])
+
+    def test_subprocess_host_is_forced_to_github(self):
+        with mock.patch.dict(os.environ, {"GH_HOST": "enterprise.example", "GH_REPO": "other/repo"}), \
+                mock.patch.object(open_ao_pr.subprocess, "run", return_value=mock.Mock(stdout="")) as process:
+            open_ao_pr.run(["gh", "pr", "view", "1", "--repo", APPROVED_SPEC], self.repo.path)
+        env = process.call_args.kwargs["env"]
+        self.assertEqual(env.get("GH_HOST"), "github.com")
+        self.assertNotIn("GH_REPO", env)
 
 
 class ExistingPrTests(PublisherTestCase):
@@ -361,6 +387,47 @@ class ExistingPrTests(PublisherTestCase):
 
 
 class PostTestRecheckTests(PublisherTestCase):
+    def _deleted_secret_history(self):
+        self.repo.write("docs/old-secret.md", FAKE_TOKEN + "\n")
+        secret_commit = self.repo.commit("docs: historical secret fixture")
+        self.repo.remove("docs/old-secret.md")
+        self.repo.commit("docs: remove fixture")
+        return secret_commit
+
+    def test_unattested_baseline_restored_after_scan_cannot_hide_history(self):
+        secret_commit = self._deleted_secret_history()
+        self.repo.mark_published(secret_commit)
+        real_scan = open_ao_pr.scan_publication
+
+        def restore_after_scan(*args, **kwargs):
+            result = real_scan(*args, **kwargs)
+            self.repo.mark_published(self.base)
+            return result
+
+        with mock.patch.object(open_ao_pr, "scan_publication", restore_after_scan):
+            self.assertRefused("baseline")
+
+    def test_attested_baseline_oid_is_used_even_if_ref_swaps_at_scan(self):
+        secret_commit = self._deleted_secret_history()
+        real_scan = open_ao_pr.scan_publication
+
+        def swap_during_scan(*args, **kwargs):
+            self.repo.mark_published(secret_commit)
+            try:
+                return real_scan(*args, **kwargs)
+            finally:
+                self.repo.mark_published(self.base)
+
+        with mock.patch.object(open_ao_pr, "scan_publication", swap_during_scan):
+            self.assertRefused("github-token")
+
+    def test_dry_run_refuses_baseline_drift_during_tests(self):
+        self.world.on_tests = lambda: self.repo.mark_published(self.head)
+        code, out, err = self.publish()
+        self.assertNotEqual(code, 0, out + err)
+        self.assertIn("changed", out + err)
+        self.assertEqual(self.world.network_calls(), [])
+
     def test_push_destination_change_during_tests_is_refused(self):
         self.world.on_tests = lambda: self.repo.git(
             "config", "remote.origin.pushurl", "https://github.com/attacker/fork.git")
@@ -419,6 +486,13 @@ class NewPrTests(PublisherTestCase):
         code, out, err = self.publish("--publish", create=True)
         self.assertNotEqual(code, 0, out + err)
         self.assertEqual(self.world.pushes, [])
+
+    def test_create_binds_hostname_before_any_pr_mutation(self):
+        self.world.configured_gh_host = "enterprise.example"
+        code, out, err = self.publish("--publish", create=True)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.world.gh_hosts)
+        self.assertEqual(set(self.world.gh_hosts), {"github.com"})
 
     def test_creation_not_reported_as_draft_without_verification(self):
         self.world.create_as_draft = False
