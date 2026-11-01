@@ -63,3 +63,7 @@ Security reviews and tests that prove what **must not be deleted** are especiall
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## AO contributions and review
+
+This product can be developed by an Agent Orchestrator team, but only files from this dedicated public repository may be published. See [the AO-to-GitHub workflow](docs/AO_SYNC.md) for prepublication safeguards, local dry-run and draft pull requests. No private orchestrator history is synchronized.
