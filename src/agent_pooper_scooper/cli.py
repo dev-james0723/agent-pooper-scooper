@@ -232,6 +232,8 @@ def build_parser():
     task_end.set_defaults(func=_cmd_task_end)
     from . import managed_cli
     managed_cli.add_commands(commands)
+    from . import integration_cli
+    integration_cli.add_commands(commands)
     return parser
 
 

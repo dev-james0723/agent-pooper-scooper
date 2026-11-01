@@ -245,6 +245,48 @@ class InstalledCliSmoke(unittest.TestCase):
                 self.assertNotIn("Traceback", stderr)
                 self.assertEqual(broker.returncode, 0, stderr)
 
+    def test_installed_integration_routing_with_hermetic_bridge(self):
+        with tempfile.TemporaryDirectory(prefix="aps-route-", dir="/private/tmp" if os.path.isdir("/private/tmp") else None) as tmp:
+            base = Path(tmp).resolve()
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            def run(*args, expected=0):
+                result = subprocess.run([APS, *map(str, args)], cwd=base, env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertNotIn(str(base), result.stdout + result.stderr)
+                return json.loads(result.stdout) if result.stdout else None
+            executable = base / "ao-fixture"
+            executable.write_text("#!" + sys.executable + "\nimport json,sys\n"
+                                  "assert sys.argv[1:]==['session','get','fixture-session','--json']\n"
+                                  "print(json.dumps({'session':{'id':'fixture-session','projectId':'fixture-project','status':'working','private':'discard me'}}))\n")
+            executable.chmod(0o700)
+            observed = run("integrations", "observe-ao", "--session-id", "fixture-session", "--project-id", "fixture-project",
+                           "--executable", executable, "--public")
+            self.assertTrue(observed["identity_verified"])
+            self.assertEqual(observed["status"], "active")
+            self.assertFalse(observed["can_authorize_cleanup"])
+            run("managed", "init", base / "store", "--owner-key-output", base / "owner.json")
+            report = base / "report.json"
+            report.write_text(json.dumps({"removed": {"count": 0, "bytes": 0}, "private": str(base)}))
+            bridge = base / "bridge.py"
+            bridge.write_text("import json,sys\n"
+                              "request=json.load(sys.stdin)\n"
+                              "assert request['tool']=='notify' and request['arguments']['deviceId']=='fixture-device'\n"
+                              "assert request['arguments']['title']=='APS product integration TEST'\n"
+                              "assert 'Reclaimed capacity unknown.' in request['arguments']['message']\n"
+                              "print(json.dumps({'content':[{'type':'text','text':'Notification sent.'}]}))\n")
+            prefix = ("integrations", "notice", base / "store", "--owner-key-file", base / "owner.json", "--report", report,
+                      "--operation-id", "fixture-notice", "--device-id", "fixture-device", "--mission-id", "fixture-mission")
+            self.assertEqual(run(*prefix, "--public")["status"], "not_attempted")
+            self.assertIsNone(run(*prefix, "--send", "--stdio", "--public", expected=1))
+            receipt = run(*prefix, "--send", "--test-mode", "--bridge-command-json", json.dumps([sys.executable, "-I", "-B", str(bridge)]), "--public")
+            self.assertEqual(receipt["status"], "provider_acknowledged")
+            self.assertFalse(receipt["user_seen_verified"])
+            status = run("integrations", "notice-status", base / "store", "--owner-key-file", base / "owner.json",
+                         "--operation-id", "fixture-notice", "--device-id", "fixture-device", "--mission-id", "fixture-mission", "--public")
+            self.assertEqual(status, receipt)
+
     def test_installed_observe_only_workflow(self):
         self.assertIsNotNone(APS, "pass the installed aps executable")
         with tempfile.TemporaryDirectory() as tmp:

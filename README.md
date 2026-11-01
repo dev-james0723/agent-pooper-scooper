@@ -57,6 +57,17 @@ aps task-end task.json --events events.jsonl --evidence snapshot.json --public
 
 File evidence is an unauthenticated operator assertion, bound to the manifest digest and a short freshness window. The planner checks explicit root approvals, identity, terminal state, grace, complete reference/lease claims, Git/worktree and mount exclusions. Unknown means KEEP. Candidates are regular files only; even a `WOULD_REMOVE` result has execution **BLOCKED**. `--execute` returns exit 1 without performing cleanup. See [planner boundaries and research](docs/PHASE2.md).
 
+## Explicit live observations and report delivery
+
+```sh
+aps integrations observe-ao --session-id configured-session --project-id configured-project --public
+aps integrations observe-kynlo --device-id configured-device --mission-id configured-mission --agent --public
+```
+
+AO observations invoke and parse the native CLI but never grant cleanup authority. Kynlo requires an explicit verified device/mission/agent-handle binding and a configured callback; unavailable handles/transports remain unknown. No endpoint, credentials, default device or global reference/resume fence is inferred.
+
+After managed collection exits its fence, `aps integrations notice` can project a selected report into a numeric-only notification. It defaults to `not_attempted`; `--send` requires an explicit trusted argv bridge or private supervised stdio transport. The owner capability stays in its private file. The persisted intent prevents blind resending on timeout or restart. `notice-status` reads/reconciles delivery classification; provider acknowledgement never proves someone saw a banner. Private stdio frames contain routing identifiers and cannot be combined with `--public`. See [the transport and delivery contract](docs/LIVE_INTEGRATIONS.md).
+
 ## Example Scoop Report
 
 Illustrative numbers only — no cleanup has occurred:
