@@ -97,6 +97,13 @@ def producer_operation_id(request_id):
     return "producer:" + hashlib.sha256(_id(request_id).encode()).hexdigest()
 
 
+def _collection_id(operation_id):
+    value = _id(operation_id)
+    if value.startswith(("producer:", "owner:")):
+        raise AuthorityError("reserved_operation_domain")
+    return value
+
+
 def _deadline(value=None):
     now = time.monotonic()
     value = now + 3 if value is None else value
@@ -616,7 +623,7 @@ class ManagedAuthority:
                               "leases": [x for x in claims if x["kind"] == "lease"], "recovery_required": state["recovery_required"]})
 
     def approve(self, task_id, plan_digest, artifact_ids, expected_revision, operation_id, ttl_seconds=30):
-        _id(operation_id)
+        _collection_id(operation_id)
         if not isinstance(plan_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_digest) or not artifact_ids or len(set(artifact_ids)) != len(artifact_ids):
             raise AuthorityError("invalid_approval_payload")
         if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 300:
@@ -659,17 +666,36 @@ class ManagedAuthority:
             return _strict_json(row[0]) if row and row[0] else None
 
     def operation_receipts(self, operation_id, plan_digest, approval_id, artifact_ids):
+        _collection_id(operation_id)
         with self._locked() as (conn, state, root, deadline):
             row = conn.execute("SELECT body FROM approvals WHERE id=?", (approval_id,)).fetchone()
             if row is None:
                 raise AuthorityError("approval_missing")
             grant = _strict_json(row[0])
-            if grant["operation_id"] != operation_id or grant["plan_digest"] != plan_digest or grant["artifact_ids"] != sorted(artifact_ids):
+            if (grant["store_id"] != state["store_id"] or grant["approval_id"] != approval_id
+                    or grant["operation_id"] != operation_id or grant["plan_digest"] != plan_digest or grant["artifact_ids"] != sorted(artifact_ids)):
                 raise AuthorityError("idempotency_payload_changed")
-            rows = conn.execute("SELECT outcome,receipt FROM intents WHERE operation=?", (operation_id,)).fetchall()
-            if any(outcome in ("pending", "unknown") for outcome, _ in rows):
+            rows = conn.execute("SELECT artifact,body,outcome,receipt FROM intents WHERE operation=? ORDER BY artifact", (operation_id,)).fetchall()
+            seen = set()
+            for artifact, raw, outcome, receipt in rows:
+                body = _strict_json(raw)
+                if (body.get("kind") != "retirement" or body.get("store_id") != state["store_id"]
+                        or body.get("task_id") != grant["task_id"] or state["artifacts"].get(artifact, {}).get("task_id") != grant["task_id"]
+                        or body.get("operation_id") != operation_id or body.get("artifact_id") != artifact
+                        or body.get("plan_digest") != plan_digest or body.get("approval_id") != approval_id
+                        or artifact not in artifact_ids or artifact in seen):
+                    raise AuthorityError("operation_receipt_binding_mismatch")
+                seen.add(artifact)
+            if any(outcome in ("pending", "unknown") for _, _, outcome, _ in rows):
                 raise AuthorityError("RECOVERY_REQUIRED")
-            receipts = [_strict_json(receipt) for _, receipt in rows]
+            receipts = [_strict_json(receipt) for _, _, _, receipt in rows]
+            for (_, raw, outcome, _), receipt in zip(rows, receipts):
+                body = _strict_json(raw)
+                if (outcome not in ("unlinked", "not_removed", "reconciled_missing", "reconciled_present")
+                        or not isinstance(receipt, dict) or receipt.get("outcome") != outcome
+                        or any(receipt.get(k) != body[k] for k in ("store_id", "operation_id", "artifact_id", "plan_digest"))
+                        or receipt.get("identity") != body["expected_identity"]):
+                    raise AuthorityError("operation_receipt_binding_mismatch")
             if receipts and len(receipts) != len(artifact_ids):
                 raise AuthorityError("partial_operation_replan", receipts=receipts)
             return receipts or None
@@ -735,9 +761,12 @@ class Fence:
             body = _strict_json(self.conn.execute("SELECT body FROM intents WHERE operation=? AND artifact=?", (prepared_intent.operation_id, prepared_intent.artifact_id)).fetchone()[0])
             if (prepared_intent.expected_identity != body["expected_identity"] or prepared_intent.store_id != body["store_id"] or prepared_intent.plan_digest != body["plan_digest"]):
                 raise AuthorityError("prepared_intent_changed")
+        if time.monotonic() >= self.deadline:
+            raise AuthorityError("fence_inactive_or_expired")
 
     def prepare(self, operation_id, plan_digest, artifact_id, expected_identity, approval_id):
         self.check()
+        _collection_id(operation_id)
         if self.reviewed_revision is None:
             raise AuthorityError("reviewed_revision_required")
         row = self.conn.execute("SELECT body FROM approvals WHERE id=?", (approval_id,)).fetchone()
@@ -748,7 +777,7 @@ class Fence:
                 or grant["operation_id"] != operation_id or grant["producer_generation"] != self.original_generation
                 or grant["revision"] != self.reviewed_revision or artifact_id not in grant["artifact_ids"] or _now() >= _seconds(grant["expires_at"])):
             raise AuthorityError("approval_binding_or_expiry")
-        body = {"store_id": self.state["store_id"], "operation_id": _id(operation_id), "artifact_id": _id(artifact_id),
+        body = {"kind": "retirement", "store_id": self.state["store_id"], "task_id": self.task_id, "operation_id": _id(operation_id), "artifact_id": _id(artifact_id),
                 "plan_digest": plan_digest, "approval_id": approval_id, "expected_identity": expected_identity}
         payload_hash = _hash(body)
         old = self.conn.execute("SELECT hash,outcome,receipt FROM intents WHERE operation=? AND artifact=?", (operation_id, artifact_id)).fetchone()

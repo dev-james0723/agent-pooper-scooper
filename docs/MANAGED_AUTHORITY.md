@@ -130,6 +130,11 @@ stale revision checks. Completed requests return stored receipts only. Changed
 payload refuses; pending requires recovery; partial batches require a fresh
 review rather than replaying unstarted deletions. `prepare` returning a receipt
 dictionary is likewise a completed replay, never a fresh effect token.
+The `producer:` and `owner:` operation domains are reserved and cannot be
+approved as collection requests. Replay additionally checks retirement kind,
+store/task, exact plan/approval/object set and stored receipt identity/outcome;
+a producer-create receipt can never masquerade as completed collection.
+Fence checks repeat their deadline test after their own identity/DB observations.
 
 ## Research basis
 

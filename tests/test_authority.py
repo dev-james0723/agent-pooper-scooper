@@ -129,6 +129,17 @@ class AuthorityTests(unittest.TestCase):
                 fence.prepare("different", "a" * 64, item["artifact_id"],
                               {k: item[k] for k in authority.IDENTITY_FIELDS}, grant["approval_id"])
 
+    def test_producer_operation_cannot_be_approved_as_collection_replay(self):
+        artifact = self.owner.producer_call(self.creds, "write", {"data": b"must not fake collection", "artifact_class": "temp", "disposable": True}, request_id="origin")
+        self.call("terminal", status="completed"); self.clock += 3600
+        snapshot = self.owner.snapshot("task")
+        collision = authority.producer_operation_id("origin")
+        with self.assertRaises(authority.AuthorityError):
+            self.owner.approve("task", "a" * 64, [artifact], snapshot["revision"], collision, 30)
+        item = snapshot["artifacts"][0]
+        self.assertEqual((Path(snapshot["root"]["path"]) / item["name"]).read_bytes(), b"must not fake collection")
+        self.assertEqual(self.owner.pending_operations("task"), [])
+
     def test_intent_is_durable_before_effect_and_recovery_blocks_all(self):
         snap, item, grant = self.finished()
         with self.owner.transaction("task", snap["revision"], time.monotonic() + 1) as fence:
@@ -170,6 +181,19 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(receipt["outcome"], "unlinked")
         self.assertFalse(self.owner.snapshot("task")["recovery_required"])
         self.assertEqual(self.owner.receipt("operation", item["artifact_id"]), receipt)
+
+    def test_fence_check_rejects_expiry_during_its_own_observation(self):
+        snap, item, grant = self.finished()
+        with self.owner.transaction("task", snap["revision"], time.monotonic() + .15) as fence:
+            intent = self.prepare(fence, item, grant)
+            original = os.fstat
+            def delayed(fd):
+                if fd == fence.root_fd: time.sleep(.18)
+                return original(fd)
+            with mock.patch.object(authority.os, "fstat", side_effect=delayed):
+                with self.assertRaises(authority.AuthorityError): fence.check(intent)
+        self.assertTrue(self.owner.snapshot("task")["recovery_required"])
+        self.assertEqual((Path(snap["root"]["path"]) / item["name"]).read_bytes(), b"fixture bytes")
 
     def test_replaced_object_never_reconciles_or_unlinks(self):
         snap, item, grant = self.finished()
