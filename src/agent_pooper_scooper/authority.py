@@ -92,6 +92,11 @@ def _id(value):
     return value
 
 
+def producer_operation_id(request_id):
+    """Bound an internal intent domain without shrinking accepted request IDs."""
+    return "producer:" + hashlib.sha256(_id(request_id).encode()).hexdigest()
+
+
 def _deadline(value=None):
     now = time.monotonic()
     value = now + 3 if value is None else value
@@ -207,14 +212,17 @@ class ManagedAuthority:
     @staticmethod
     def _connect(path, timeout=.1):
         conn = sqlite3.connect(str(path) + "/control/registry.sqlite3", timeout=max(0, timeout), isolation_level=None)
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA fullfsync=ON")
-        journal = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-        if (journal != "delete" or conn.execute("PRAGMA synchronous").fetchone()[0] != 2
-                or conn.execute("PRAGMA fullfsync").fetchone()[0] != 1):
+        try:
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA fullfsync=ON")
+            journal = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            if (journal != "delete" or conn.execute("PRAGMA synchronous").fetchone()[0] != 2
+                    or conn.execute("PRAGMA fullfsync").fetchone()[0] != 1):
+                raise AuthorityError("database_durability_configuration_unknown")
+            return conn
+        except BaseException:
             conn.close()
-            raise AuthorityError("database_durability_configuration_unknown")
-        return conn
+            raise
 
     def __init__(self, path, *, owner_key):
         self.path = os.fspath(path)
@@ -488,7 +496,7 @@ class ManagedAuthority:
                 state["recovery_required"] = True
                 state["revision"] += 1
                 intent = {"kind": "producer_create", "artifact_id": artifact, "name": item["name"], "expected_identity": None}
-                operation = "producer:" + request_id
+                operation = producer_operation_id(request_id)
                 self._commit(conn, state, [("INSERT INTO intents VALUES(?,?,?,?,?,NULL)", (operation, artifact, payload_hash, _json(intent), "pending"))])
                 if time.monotonic() >= limit:
                     raise AuthorityError("producer_effect_deadline_recovery_required")
@@ -568,7 +576,28 @@ class ManagedAuthority:
 
     def snapshot(self, task_id):
         with self._locked() as (conn, state, root, deadline):
-            return self._snapshot(state, task_id)
+            result = self._snapshot(state, task_id)
+            result["pending_operations"] = self._pending(conn, state, task_id)
+            return result
+
+    @staticmethod
+    def _pending(conn, state, task_id=None):
+        if task_id is not None:
+            _id(task_id)
+        result = []
+        for operation, artifact, body, status in conn.execute("SELECT operation,artifact,body,outcome FROM intents WHERE outcome IN ('pending','unknown') ORDER BY operation,artifact"):
+            item = state["artifacts"][artifact]
+            if task_id is None or item["task_id"] == task_id:
+                intent = _strict_json(body)
+                result.append({"operation_id": operation, "artifact_id": artifact, "task_id": item["task_id"],
+                               "plan_digest": intent.get("plan_digest"), "kind": intent.get("kind", "retirement"),
+                               "status": status, "outcome": status})
+        return result
+
+    def pending_operations(self, task_id=None):
+        """Trusted read-only recovery discovery, including during recovery gate."""
+        with self._locked() as (conn, state, root, deadline):
+            return self._pending(conn, state, task_id)
 
     @staticmethod
     def _snapshot(state, task_id):
@@ -687,7 +716,9 @@ class Fence:
 
     def snapshot(self):
         self.check()
-        return self.owner._snapshot(self.state, self.task_id)
+        result = self.owner._snapshot(self.state, self.task_id)
+        result["pending_operations"] = self.owner._pending(self.conn, self.state, self.task_id)
+        return result
 
     def check(self, prepared_intent=None):
         if not self.active or os.getpid() != self.owner._pid or time.monotonic() >= self.deadline:
@@ -785,7 +816,16 @@ class Fence:
             outcome = "unknown"
         if outcome == "not_removed" and (current is None or _identity(current) != body["expected_identity"]):
             outcome = "unknown"
-        result = dict(receipt, store_id=self.state["store_id"], operation_id=intent.operation_id,
+        safe = {}
+        if post is not None:
+            safe["post_unlink"] = {k: post[k] for k in ("dev", "ino", "nlink")}
+        if "namespace_absent" in receipt:
+            if type(receipt["namespace_absent"]) is not bool:
+                raise AuthorityError("invalid_namespace_receipt")
+            if receipt["namespace_absent"] != (current is None):
+                outcome = "unknown"
+            safe["namespace_absent"] = current is None
+        result = dict(safe, store_id=self.state["store_id"], operation_id=intent.operation_id,
                       artifact_id=intent.artifact_id, plan_digest=intent.plan_digest,
                       identity=body["expected_identity"], outcome=outcome,
                       removed_bytes=item["size"] if outcome == "unlinked" else (0 if outcome == "not_removed" else None),
@@ -802,6 +842,11 @@ class AuthorityServer:
     def __init__(self, authority, socket_path=None, collector=None):
         self.authority = authority
         self._pid = os.getpid()
+        self._serving = threading.Event()
+        self._serving_thread = None
+        self._shutdown_thread = None
+        self._lifecycle_guard = threading.Lock()
+        self._closed = False
         self.collector = collector
         self.socket_path = os.fspath(socket_path or (Path(authority.path) / "control/broker.sock"))
         if len(os.fsencode(self.socket_path)) > 100 or os.path.lexists(self.socket_path):
@@ -814,8 +859,11 @@ class AuthorityServer:
                     raw = self.rfile.readline(MAX_FRAME + 1)
                     if len(raw) > MAX_FRAME or not raw.endswith(b"\n"):
                         raise AuthorityError("invalid_frame")
-                    request = _strict_json(raw.decode())
-                    if not isinstance(request, dict) or set(request) != {"version", "method", "params", "credentials", "request_id", "timeout_seconds"} or request["version"] != 1:
+                    try:
+                        request = _strict_json(raw.decode())
+                    except (ValueError, UnicodeError, RecursionError):
+                        raise AuthorityError("invalid_frame") from None
+                    if not isinstance(request, dict) or set(request) != {"version", "method", "params", "credentials", "request_id", "timeout_seconds"} or type(request["version"]) is not int or request["version"] != 1:
                         raise AuthorityError("invalid_protocol")
                     budget = request["timeout_seconds"]
                     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not 0 < budget <= 2:
@@ -853,21 +901,46 @@ class AuthorityServer:
     def serve_forever(self):
         if os.getpid() != self._pid:
             raise AuthorityError("inherited_server_after_fork")
-        self._server.serve_forever(poll_interval=.05)
+        with self._lifecycle_guard:
+            if self._closed or self._serving.is_set():
+                raise AuthorityError("server_not_startable")
+            self._serving_thread = threading.get_ident()
+            self._serving.set()
+        try:
+            self._server.serve_forever(poll_interval=.05)
+        finally:
+            self._serving.clear()
 
     def start(self):
         if self._thread is not None:
             raise AuthorityError("server_already_started")
         self._thread = threading.Thread(target=self.serve_forever)
         self._thread.start()
+        if not self._serving.wait(.5):
+            raise AuthorityError("server_start_pending")
         return self
 
     def shutdown(self):
-        self._server.shutdown()
+        if os.getpid() != self._pid:
+            raise AuthorityError("inherited_server_after_fork")
+        if not self._serving.is_set():
+            return  # In particular: BaseServer.shutdown on an unstarted server hangs.
+        if threading.get_ident() == self._serving_thread:
+            raise AuthorityError("shutdown_from_serving_thread")
+        with self._lifecycle_guard:
+            if self._shutdown_thread is None:
+                self._shutdown_thread = threading.Thread(target=self._server.shutdown, daemon=True)
+                self._shutdown_thread.start()
+            waiter = self._shutdown_thread
+        waiter.join(.5)
+        if waiter.is_alive():
+            raise AuthorityError("server_shutdown_pending")
 
     def close(self):
         if os.getpid() != self._pid:
             raise AuthorityError("inherited_server_after_fork")
+        if self._closed:
+            return
         if self._thread is not None:
             self.shutdown()
             self._thread.join(3)
@@ -879,6 +952,7 @@ class AuthorityServer:
             if (st.st_dev, st.st_ino) != (self._socket_identity["dev"], self._socket_identity["ino"]) or not stat.S_ISSOCK(st.st_mode):
                 raise AuthorityError("socket_identity_changed")
             os.unlink(self.socket_path)
+        self._closed = True
 
     def __enter__(self):
         return self.start()
@@ -921,7 +995,7 @@ class ProducerClient:
             raise AuthorityError("producer_outcome_unknown" if sent else "broker_unavailable") from None
         if not result.get("ok"):
             code = result.get("error", "broker_refused")
-            if code in ("producer_outcome_unknown", "authority_storage_unavailable", "producer_effect_deadline_recovery_required"):
+            if code in ("producer_outcome_unknown", "authority_storage_unavailable", "producer_effect_deadline_recovery_required", "producer_write_incomplete"):
                 self.pending_request = request_id
             raise AuthorityError(code)
         return result["result"]

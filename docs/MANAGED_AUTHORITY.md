@@ -106,6 +106,8 @@ identity. Optional post-unlink identity uses stable dev/ino with nlink zero,
 not the old ctime. Finish may record an already-performed effect after deadline;
 it never grants a new one. Verified logical removed bytes require a durable
 confirmed unlink receipt. Reclaimed capacity remains unknown.
+Unknown caller receipt fields, including nested post-unlink extras, are dropped
+before persistence or return. Receipts contain only the documented metadata DTO.
 
 Pending/unknown intent blocks ALL producer grants, reads, writes, references,
 leases and resumes after crash-released locks. A trusted explicit
@@ -113,6 +115,15 @@ leases and resumes after crash-released locks. A trusted explicit
 missing becomes `reconciled_missing` with unknown causality/removed bytes;
 the same object present becomes permanently retired and retained; replacement
 or unknown identity remains frozen. IDs are never resurrected or reused.
+Trusted `pending_operations(task_id=None)` and snapshot `pending_operations`
+expose exact operation_id, artifact_id, task_id, plan_digest, kind and
+status/outcome for recovery discovery, including while the gate is active.
+Producer-create operation IDs use a bounded domain-separated SHA-256 form;
+the maximum accepted 128-character request ID remains publicly reconcilable.
+SQLite configuration failures close the allocated connection. Server shutdown
+refuses inherited use, returns without waiting on an unstarted server, and
+bounds waiting on its own serving loop. Kernel I/O itself is not universally
+time-bounded.
 
 `operation_receipts` validates exact operation/plan/approval/object binding before
 stale revision checks. Completed requests return stored receipts only. Changed

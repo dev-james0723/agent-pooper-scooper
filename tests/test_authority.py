@@ -3,6 +3,8 @@ import copy
 import fcntl
 import multiprocessing
 import os
+import select
+import signal
 from pathlib import Path
 import sys
 import tempfile
@@ -23,6 +25,14 @@ def try_process_read(path, key, credentials, artifact, queue):
         queue.put("read")
     except authority.AuthorityError as exc:
         queue.put(str(exc))
+
+
+def shutdown_unstarted(path, key, queue):
+    owner = authority.ManagedAuthority(path, owner_key=key)
+    server = authority.AuthorityServer(owner)
+    server.shutdown()
+    server.close()
+    queue.put("bounded")
 
 
 class AuthorityTests(unittest.TestCase):
@@ -285,6 +295,154 @@ class AuthorityTests(unittest.TestCase):
                 self.assertIsNone(client.pending_request)
         self.assertFalse(stderr.getvalue(), "server logged an unhandled input traceback")
         self.assertEqual(self.owner.snapshot("task")["leases"], [])
+
+    def test_maximum_request_id_pending_before_open_has_public_recovery_ids(self):
+        original = os.open
+        def refuse_create(path, flags, *args, **kwargs):
+            if isinstance(path, str) and path.endswith(".blob") and flags & os.O_CREAT:
+                raise PermissionError("fixture create denied after intent")
+            return original(path, flags, *args, **kwargs)
+        with mock.patch.object(authority.os, "open", side_effect=refuse_create):
+            with self.assertRaises(authority.AuthorityError):
+                self.owner.producer_call(self.creds, "write", {"data": b"retained", "artifact_class": "temp", "disposable": True}, request_id="a" * 128)
+        snapshot = self.owner.snapshot("task")
+        self.assertTrue(snapshot["recovery_required"])
+        with self.owner._locked() as (conn, state, root, deadline):
+            minted, artifact = conn.execute("SELECT operation,artifact FROM intents WHERE outcome='pending'").fetchone()
+            self.assertEqual(os.listdir(root), [])
+        # This exercises existing public APIs even before the status helper is added.
+        self.assertIsNone(self.owner.receipt(minted, artifact))
+        public = self.owner.pending_operations("task")
+        self.assertEqual(public[0]["operation_id"], minted)
+        receipt = self.owner.reconcile(public[0]["operation_id"], public[0]["artifact_id"])
+        self.assertEqual(receipt["outcome"], "reconciled_missing")
+        self.assertIsNone(receipt["removed_bytes"])
+        self.assertFalse(self.owner.snapshot("task")["recovery_required"])
+        self.assertEqual(self.owner.receipt(minted, artifact), receipt)
+
+    def test_connection_is_closed_when_pragma_initialization_fails(self):
+        sqlite = authority.sqlite3
+        original = sqlite.connect
+        opened, closed = [], []
+        class Tracked(sqlite.Connection):
+            def close(self):
+                closed.append(self)
+                return super().close()
+        def connect(*args, **kwargs):
+            kwargs["factory"] = Tracked
+            result = original(*args, **kwargs); opened.append(result)
+            return result
+        blocker = original(self.path / "control/registry.sqlite3", isolation_level=None)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            with mock.patch.object(sqlite, "connect", side_effect=connect):
+                with self.assertRaises(authority.AuthorityError):
+                    self.owner.snapshot("task")
+            self.assertEqual(len(opened), 1)
+            self.assertEqual(len(closed), 1, "PRAGMA failure leaked allocated connection")
+        finally:
+            blocker.rollback(); blocker.close()
+            for conn in opened:
+                if conn not in closed:conn.close()
+        self.assertFalse(self.owner.snapshot("task")["recovery_required"])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork unavailable")
+    def test_fork_context_unwind_preserves_os_flock_for_fresh_process(self):
+        import subprocess
+        probe = "import os,sys,fcntl\nfd=os.open(sys.argv[1],os.O_RDWR)\ntry:\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);print('acquired')\nexcept BlockingIOError:print('blocked')\nfinally:os.close(fd)\n"
+        snap = self.owner.snapshot("task")
+        cm = self.owner.transaction("task", snap["revision"], time.monotonic() + 3)
+        cm.__enter__(); rfd, wfd = os.pipe(); child = os.fork()
+        if child == 0:
+            os.close(rfd)
+            try:
+                cm.__exit__(None, None, None)  # Exercise inherited generator/finally unwind.
+                os.write(wfd, b"unwound")
+            finally:
+                os._exit(0)
+        os.close(wfd)
+        try:
+            ready, _, _ = select.select([rfd], [], [], .5)
+            self.assertTrue(ready)
+            self.assertEqual(os.read(rfd, 32), b"unwound")
+            os.waitpid(child, 0); child = None
+            result = subprocess.run([sys.executable, "-B", "-c", probe, str(self.path / "control/lock")],capture_output=True,text=True,timeout=1)
+            self.assertEqual(result.stdout.strip(), "blocked")
+        finally:
+            if child is not None:
+                os.kill(child, signal.SIGKILL); os.waitpid(child, 0)
+            os.close(rfd); cm.__exit__(None, None, None)
+        result = subprocess.run([sys.executable, "-B", "-c", probe, str(self.path / "control/lock")],capture_output=True,text=True,timeout=1)
+        self.assertEqual(result.stdout.strip(), "acquired")
+
+    def test_finish_ignores_unknown_private_receipt_fields_before_persistence(self):
+        import json
+        sentinel = "APS private receipt extra must never persist 384a9f"
+        snap, item, grant = self.finished()
+        with self.owner.transaction("task", snap["revision"], time.monotonic() + 1) as fence:
+            intent = self.prepare(fence, item, grant)
+            os.unlink(item["name"], dir_fd=fence.root_fd); os.fsync(fence.root_fd)
+            receipt = fence.finish(intent, "unlinked", {"identity": intent.expected_identity,
+                "private_payload": sentinel, "post_unlink": {"dev": item["dev"], "ino": item["ino"], "nlink": 0, "private": sentinel}})
+        self.assertFalse(sentinel in json.dumps(receipt), "private caller extras escaped receipt projection")
+        for path in (self.path / "control").iterdir():
+            if path.is_file(): self.assertFalse(sentinel.encode() in path.read_bytes(), "private extras persisted")
+
+    def test_unstarted_server_shutdown_is_bounded(self):
+        ctx = multiprocessing.get_context("spawn"); queue = ctx.Queue()
+        child = ctx.Process(target=shutdown_unstarted, args=(str(self.path), self.owner.owner_key, queue))
+        child.start()
+        try:
+            child.join(1.5)
+            self.assertFalse(child.is_alive(), "shutdown waited for a serve thread that never existed")
+            self.assertEqual(queue.get(timeout=.5), "bounded")
+        finally:
+            if child.is_alive(): child.terminate(); child.join(1)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork unavailable")
+    def test_inherited_server_shutdown_refuses_without_stopping_parent(self):
+        artifact = self.call("write", data=b"parent survives", artifact_class="temp", disposable=True)
+        with authority.AuthorityServer(self.owner) as server:
+            rfd, wfd = os.pipe(); child = os.fork()
+            if child == 0:
+                os.close(rfd)
+                try:
+                    server.shutdown(); os.write(wfd, b"BAD")
+                except authority.AuthorityError:
+                    os.write(wfd, b"refused")
+                finally:
+                    os._exit(0)
+            os.close(wfd)
+            try:
+                readable, _, _ = select.select([rfd], [], [], .5)
+                self.assertTrue(readable, "inherited server shutdown blocked on parent-only Event")
+                self.assertEqual(os.read(rfd, 32), b"refused")
+                self.assertEqual(authority.ProducerClient(server.socket_path, self.creds).read(artifact), b"parent survives")
+            finally:
+                if os.waitpid(child, os.WNOHANG)[0] == 0:
+                    os.kill(child, signal.SIGKILL); os.waitpid(child, 0)
+                os.close(rfd)
+
+    def test_malformed_frames_refuse_before_mutation_without_tracebacks(self):
+        import contextlib
+        import io
+        import json
+        import socket
+        stderr = io.StringIO(); before = self.owner.snapshot("task")["revision"]
+        base = {"version": 1, "method": "start", "params": {}, "credentials": self.creds,
+                "request_id": "malformed", "timeout_seconds": .2}
+        frames = []
+        for key, value in (("version", True), ("version", 1.0), ("params", []), ("credentials", [])):
+            frame = dict(base); frame[key] = value; frames.append(json.dumps(frame).encode() + b"\n")
+        frames.append(b"[" * 2000 + b"0" + b"]" * 2000 + b"\n")
+        with contextlib.redirect_stderr(stderr), authority.AuthorityServer(self.owner) as server:
+            for frame in frames:
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(1); client.connect(server.socket_path); client.sendall(frame)
+                    with client.makefile("rb") as stream: result = json.loads(stream.readline(4096))
+                self.assertFalse(result["ok"], "malformed request was accepted")
+        self.assertFalse(stderr.getvalue(), "untrusted frame caused a server traceback")
+        self.assertEqual(self.owner.snapshot("task")["revision"], before)
 
     def test_shared_flock_alone_is_not_a_thread_mutex_control(self):
         path = Path(self.temp.name) / "control-lock"
