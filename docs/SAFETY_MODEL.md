@@ -1,4 +1,6 @@
-# Safety model (proposed, not implemented)
+# Safety model
+
+Phase 1 implements observation, validation, and reporting only. The automatic-cleanup conditions below remain requirements for a future executor; Phase 1 cannot satisfy all of them and never removes artifacts. Manifest operations write the explicitly selected metadata file; reports write only a new explicitly selected output file. A failed manifest write leaves its private staging file for inspection.
 
 ## Minimum conditions for automatic cleanup
 

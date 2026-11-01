@@ -6,7 +6,7 @@
 
 Agent Pooper Scooper is an open-source project for **task-aware, safety-first disk cleanup and friendly Scoop Reports**. The goal: reclaim disposable scratch space without destroying work that AI coding agents, other tasks, or future resumed sessions might still need.
 
-> **Project status: pre-alpha / design stage.** This repository contains the public product plan and safety specification, **not a working cleanup engine**. No automatic cleaner has been released or installed by this project.
+> **Project status: pre-alpha / read-only planning.** The package provides task manifests, strict event validation, on-demand telemetry, JSON/Markdown Scoop Reports, and a conservative regular-file planner with null/file adapter seams. **There is no cleanup executor or automatic cleaner.** Execution is blocked; background watching and live provider/notification integrations remain unavailable.
 
 ## Why?
 
@@ -14,16 +14,47 @@ Coding agents can generate gigabytes of build outputs, test caches, temporary fi
 
 **Task completed does NOT mean its files are disposable.**
 
-## Planned features
+## Features and roadmap
 
-- **Task-aware attribution** — know what each agent/task created and how much disk space it used.
+- **Manifest-based attribution** — record artifacts with task, host, producer, class, explicit disposable flag, timestamps, and device/inode identity. Unrecorded writes are not attributed.
 - **Safe cleanup** — auto-remove only explicitly disposable, task-owned scratch files after checked leases, reference checks and a retention grace period.
-- **Scoop Reports** — after every task, report created, retained, cleanup-eligible, removed and *actually reclaimed* bytes, with categories, receipts and safety skips.
-- **Disk pressure alerts** — watch available space and warn before your SSD fills up.
-- **Agent integrations** — provider-neutral task event API, with future optional orchestrator/desktop-control adapters.
-- **Auditability** — dry-run, reproducible decisions, detailed reasons, rollback/quarantine where practical, and independent security tests.
+- **Scoop Reports** — manually generate measured, retained, dry-run candidate, unknown, and skipped accounting. Removed and reclaimed-by-this-tool bytes are always zero in Phase 1.
+- **Read-only telemetry** — volume capacity via `statvfs`, bounded registered-root walks, hardlink deduplication, symlink refusal, mount-boundary skips, and explicit unknowns.
+- **Provider-neutral events** — versioned strict schemas and JSON Lines validation. Automatic integrations remain future work.
+- **Future capabilities** — disk pressure alerts, task-end automation, reference/lease protection, independently reviewed cleanup policy, and notification adapters.
 
-These are **planned capabilities**, not shipped features.
+Safe cleanup remains planned. A disposable flag or terminal event never grants deletion authority.
+
+## Install and try Phase 1
+
+Requires Python **3.10+** on macOS/POSIX. Runtime dependencies are entirely standard library. Builds use setuptools 58+ and wheel; provision approved build tools first for offline installation:
+
+```sh
+python3 -m pip install --no-index --no-deps --no-build-isolation .
+aps --version
+aps manifest init task.json --task-id demo-1 --producer example-agent \
+  --host example-host --root /absolute/physical/task-scratch
+aps manifest record task.json /absolute/physical/task-scratch/build \
+  --class build-output --disposable
+aps manifest validate task.json
+aps telemetry task.json --public
+aps report task.json --public --format markdown
+```
+
+The root and artifact must already exist. Use physical paths without symlink ancestors; on macOS `/tmp` and `/var` may be aliases. Without task events, status is unknown and all measured artifacts are retained. `--public` redacts registered-root prefixes, home/personal path prefixes, and host; inspect relative filenames before sharing.
+
+See [Phase 1 usage and limitations](docs/PHASE1.md) for events, offline packaging verification, and remaining gates.
+
+## Read-only planning and task-end reports
+
+```sh
+aps plan task.json                          # no evidence: KEEP
+aps schema planner-evidence                 # strict operator snapshot contract
+aps plan task.json --evidence snapshot.json --public
+aps task-end task.json --events events.jsonl --evidence snapshot.json --public
+```
+
+File evidence is an unauthenticated operator assertion, bound to the manifest digest and a short freshness window. The planner checks explicit root approvals, identity, terminal state, grace, complete reference/lease claims, Git/worktree and mount exclusions. Unknown means KEEP. Candidates are regular files only; even a `WOULD_REMOVE` result has execution **BLOCKED**. `--execute` returns exit 1 without performing cleanup. See [planner boundaries and research](docs/PHASE2.md).
 
 ## Example Scoop Report
 

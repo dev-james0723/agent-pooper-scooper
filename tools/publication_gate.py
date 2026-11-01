@@ -31,6 +31,7 @@ MODE_NAMES = {"120000": "symlink", "160000": "gitlink/submodule", "040000": "tre
 ALLOWED_ROOT_FILES = {
     ".gitignore", "README.md", "LICENSE", "SECURITY.md",
     "CONTRIBUTING.md", "AGENTS.md", "pyproject.toml",
+    "setup.cfg", "setup.py", "MANIFEST.in",
 }
 ALLOWED_DIRECTORIES = {"docs", "tests", "tools", "src", "examples", ".github"}
 BLOCKED_COMPONENTS = {

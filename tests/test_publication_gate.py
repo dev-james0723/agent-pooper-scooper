@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools.publication_gate import (MAX_FILE_BYTES, git_env, read_blobs, resolve_commit,
-                                    safe_relative_path, scan_publication)
+                                    safe_relative_path, scan_publication, parse_workflow)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE_CLI = REPO_ROOT / "tools" / "publication_gate.py"
@@ -115,6 +115,12 @@ class GateTestCase(unittest.TestCase):
 
 
 class PathPolicyTests(unittest.TestCase):
+    def test_exact_packaging_root_names_only(self):
+        for name in ("pyproject.toml", "setup.cfg", "setup.py", "MANIFEST.in"):
+            self.assertTrue(safe_relative_path(name), name)
+        for name in ("setup.cfg.private", "setup.py.bak", "MANIFEST", "tox.ini", ".pypirc"):
+            self.assertFalse(safe_relative_path(name), name)
+
     def test_public_paths(self):
         self.assertTrue(safe_relative_path("README.md"))
         self.assertTrue(safe_relative_path("docs/ROADMAP.md"))
@@ -125,6 +131,20 @@ class PathPolicyTests(unittest.TestCase):
         self.assertFalse(safe_relative_path("src/../secrets/token"))
         self.assertFalse(safe_relative_path("tools/.ao/private.json"))
         self.assertFalse(safe_relative_path(".github/unsafe.yml"))
+
+
+class PackagingMetadataTests(GateTestCase):
+    def test_packaging_files_are_allowed_and_scanned(self):
+        self.repo.write("setup.cfg", "[metadata]\nname = public-fixture\n")
+        self.repo.write("setup.py", "from setuptools import setup\nsetup()\n")
+        self.repo.write("MANIFEST.in", "include LICENSE\n")
+        self.repo.commit("build: public packaging metadata")
+        self.assertGatePasses()
+
+    def test_packaging_allowance_does_not_hide_secrets(self):
+        self.repo.write("setup.cfg", "[metadata]\nfixture = " + FAKE_TOKEN + "\n")
+        self.repo.commit("build: synthetic secret fixture")
+        self.assertGateFails("github-token")
 
 
 class BaselineTests(GateTestCase):
@@ -486,6 +506,15 @@ class WorkflowTests(GateTestCase):
         self.assertTrue(uses)
         for ref in uses:
             self.assertRegex(ref, r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
+
+    def test_repository_ci_preserves_required_check_and_platform_matrix(self):
+        workflow = parse_workflow((REPO_ROOT / ".github/workflows/ci.yml").read_text())
+        verify = workflow["jobs"]["verify"]
+        self.assertEqual(verify["name"], "Publication Gate / Python Tests")
+        self.assertNotIn("strategy", verify)
+        matrix = workflow["jobs"]["package"]["strategy"]["matrix"]
+        self.assertEqual(set(matrix["os"]), {"ubuntu-latest", "macos-latest"})
+        self.assertEqual(set(matrix["python"]), {"3.10", "3.15"})
 
 
 if __name__ == "__main__":
