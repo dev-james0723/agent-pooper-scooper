@@ -160,3 +160,21 @@ class ManagedCli(unittest.TestCase):
         self.assertEqual(result[0], 1)
         reconcile.assert_not_called()
         self.assertEqual(output.read_bytes(), b"original")
+
+    def test_status_discovers_pending_intent_without_raw_database_access(self):
+        authority, ident = self.eligible()
+        plan = executor.create_plan(authority, "task")
+        grant = executor.approve_plan(authority, plan, "discover-op")
+        from agent_pooper_scooper.authority import Fence
+        with mock.patch.object(Fence, "finish", side_effect=OSError("fixture unknown")):
+            executor.collect(authority, plan, execute=True, operation_id="discover-op", approval_id=grant["approval_id"])
+        result = self.run_cli(*self.owner_args("status"))
+        self.assertEqual(result[0], 0, result)
+        pending = json.loads(result[1])["pending_operations"]
+        self.assertEqual(pending[0]["artifact_id"], ident)
+        result = self.run_cli(*self.owner_args("status"), "--public")
+        self.assertEqual(json.loads(result[1]), {"pending_count": 1})
+        result = self.run_cli(*self.owner_args("reconcile"), "--operation-id", pending[0]["operation_id"], "--artifact-id", ident, "--public")
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(json.loads(result[1])["outcome"], "reconciled_missing")
+        self.assertNotIn(str(self.base), result[1] + result[2])

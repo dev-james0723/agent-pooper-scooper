@@ -116,22 +116,43 @@ class _NullOr:
     def check(self, value, where):
         return [] if value is None else self.spec.check(value, where)
 
+    def schema(self):
+        return {"anyOf": [{"type": "null"}, self.spec.schema()]}
+
 
 _N = schema._NonNegativeInt()
 _ID = schema._Pattern(r"^[A-Za-z0-9_.:-]{1,128}$", "managed identifier")
 _HEX = schema._Pattern(r"^[0-9a-f]{64}$", "SHA-256 digest")
 _IDENTITY = schema._Object({key: _N for key in _REGISTERED_IDENTITY})
 _ROOT = schema._Object({"dev": _N, "ino": _N, "uid": _N, "path": schema._AbsolutePath()})
-_ARTIFACT = schema._Object({
+_ARTIFACT_CORE = {
     "artifact_id": _ID, "name": _ID, "task_id": _ID, "origin_store_id": _ID,
     "class": schema._Enum(schema.ARTIFACT_CLASSES), "disposable": schema._Bool(),
     "origin_generation": _N, "created_at": schema._Timestamp(), "last_write_at": schema._Timestamp(),
-    "retired": schema._Bool(), "pending": schema._Bool(), "allocated_bytes": _N,
-    **{key: _N for key in _REGISTERED_IDENTITY},
-})
+    "retired": schema._Bool(), "pending": schema._Bool(),
+}
+_MATERIALIZED = schema._Object({**_ARTIFACT_CORE, "allocated_bytes": _N,
+                                **{key: _N for key in _REGISTERED_IDENTITY}})
+_UNMATERIALIZED = schema._Object({**_ARTIFACT_CORE, "retired": schema._Const(True), "pending": schema._Const(False)})
+
+
+class _RegisteredArtifact:
+    def check(self, value, where):
+        if (isinstance(value, dict) and value.get("retired") is True
+                and not set(value).intersection((*_REGISTERED_IDENTITY, "allocated_bytes"))):
+            return _UNMATERIALIZED.check(value, where)
+        return _MATERIALIZED.check(value, where)
+
+
+_ARTIFACT = _RegisteredArtifact()
 _CLAIM = schema._Object({"claim_id": _ID, "kind": schema._Enum(("reference", "lease")),
                          "artifact_id": _ID, "task_id": _ID, "producer_generation": _N,
                          "expires_at": _NullOr(schema._Timestamp())})
+_PENDING = schema._Object({
+    "operation_id": _ID, "artifact_id": _ID, "task_id": _ID,
+    "plan_digest": _NullOr(_HEX), "kind": schema._Enum(("producer_create", "retirement")),
+    "status": schema._Enum(("pending", "unknown")), "outcome": schema._Enum(("pending", "unknown")),
+})
 _SNAPSHOT = schema._Object({
     "store_id": _ID, "broker_epoch": _ID, "revision": _N, "task_id": _ID, "producer_generation": _N,
     "task_status": schema._Enum(("active", "paused", "resumable", "completed", "failed")),
@@ -139,12 +160,13 @@ _SNAPSHOT = schema._Object({
     "artifacts": schema._Array(_ARTIFACT, MAX_ENTRIES), "inventory": schema._Array(_ARTIFACT, MAX_ENTRIES),
     "registered_names": schema._Array(_ID, MAX_ENTRIES), "references": schema._Array(_CLAIM, MAX_ENTRIES),
     "leases": schema._Array(_CLAIM, MAX_ENTRIES), "recovery_required": schema._Bool(),
+    "pending_operations": schema._Array(_PENDING, MAX_ENTRIES),
 })
 _REASONS = ("protected_or_not_disposable", "retired", "task_not_terminal", "clock_unverified",
             "grace_period", "reference_present", "lease_present")
 _DECISION = schema._Object({"artifact_id": _ID, "decision": schema._Enum(("KEEP", "WOULD_REMOVE")),
                             "reasons": schema._Array(schema._Enum(_REASONS), len(_REASONS)),
-                            "identity": _IDENTITY, "apparent_bytes": _N, "allocated_bytes": _N})
+                            "identity": _NullOr(_IDENTITY), "apparent_bytes": _N, "allocated_bytes": _N})
 _PLAN = schema._Object({
     "schema": schema._Const("agent-pooper-scooper/managed-plan"), "schema_version": schema._Const(1),
     "store_id": _ID, "broker_epoch": _ID, "task_id": _ID, "revision": _N, "producer_generation": _N,
@@ -184,6 +206,7 @@ def _validate_plan(plan, *, now=None):
     ids = [d["artifact_id"] for d in plan["decisions"]]
     candidates = [d for d in plan["decisions"] if d["decision"] == "WOULD_REMOVE"]
     if (len(set(ids)) != len(ids) or any(bool(d["reasons"]) != (d["decision"] == "KEEP") for d in plan["decisions"])
+            or any(d["identity"] is None for d in candidates)
             or plan["candidate"] != {"artifact_ids": [d["artifact_id"] for d in candidates], "count": len(candidates),
                                      "apparent_bytes": sum(d["apparent_bytes"] for d in candidates),
                                      "allocated_bytes": sum(d["allocated_bytes"] for d in candidates)}):
@@ -210,14 +233,14 @@ def plan_schema():
 
 
 def _snapshot(value):
-    if _SNAPSHOT.check(value, "snapshot") or value["recovery_required"] or not 1 <= value["grace_seconds"] <= 31_536_000:
+    if (_SNAPSHOT.check(value, "snapshot") or value["recovery_required"]
+            or value["pending_operations"] or not 1 <= value["grace_seconds"] <= 31_536_000):
         raise ExecutionRefused("managed authority state is invalid or requires recovery")
     inventory = value["inventory"]
     ids = [item["artifact_id"] for item in inventory]
     names = [item["name"] for item in inventory]
-    identities = [(item["dev"], item["ino"]) for item in inventory]
-    if len(set(ids)) != len(ids) or len(set(names)) != len(names) or len(set(identities)) != len(identities):
-        raise ExecutionRefused("managed registrations repeat an object identity")
+    if len(set(ids)) != len(ids) or len(set(names)) != len(names):
+        raise ExecutionRefused("managed registrations repeat an object ID or name")
     if sorted(names) != value["registered_names"]:
         raise ExecutionRefused("managed registry inventory is incomplete")
     selected = {item["artifact_id"]: item for item in inventory if item["task_id"] == value["task_id"]}
@@ -239,11 +262,14 @@ def _make_plan(fence, *, artifact_ids=None, now=None):
     now = now or datetime.now(timezone.utc)
     inventory = {item["name"]: item for item in state["inventory"]}
     actual = _inspect_flat_root(fence.root_fd, state["root"]["path"], state["root"], set(inventory))
+    physical_identities = [(info["dev"], info["ino"]) for info in actual.values()]
+    if len(set(physical_identities)) != len(physical_identities):
+        raise ExecutionRefused("current managed objects repeat a physical identity")
     for name, item in inventory.items():
         if name not in actual:
             if not item["retired"]:
                 raise ExecutionRefused("registered live object is missing")
-        elif any(actual[name][key] != item[key] for key in _REGISTERED_IDENTITY):
+        elif any(key not in item or actual[name][key] != item[key] for key in _REGISTERED_IDENTITY):
             raise ExecutionRefused("registered object metadata changed")
     native = executor_platform.observe(fence.root_fd, state["root"]["path"])
     selected = {item["artifact_id"]: item for item in state["artifacts"]}
@@ -275,7 +301,8 @@ def _make_plan(fence, *, artifact_ids=None, now=None):
         if any(c["artifact_id"] == ident for c in state["leases"]):
             reasons.append("lease_present")
         decisions.append({"artifact_id": ident, "decision": "KEEP" if reasons else "WOULD_REMOVE",
-                          "reasons": sorted(set(reasons)), "identity": {key: item[key] for key in _REGISTERED_IDENTITY},
+                          "reasons": sorted(set(reasons)),
+                          "identity": {key: item[key] for key in _REGISTERED_IDENTITY} if all(key in item for key in _REGISTERED_IDENTITY) else None,
                           "apparent_bytes": observed["size"] if observed else 0,
                           "allocated_bytes": observed["allocated_bytes"] if observed else 0})
     candidates = [d for d in decisions if d["decision"] == "WOULD_REMOVE"]
@@ -330,7 +357,14 @@ def _fresh(fence, plan):
     return state, observed, native
 
 
+def _collection_operation(operation_id):
+    if _ID.check(operation_id, "operation") or operation_id.startswith("producer:"):
+        raise ExecutionRefused("collection operation ID is invalid or reserved for producer writes")
+    return operation_id
+
+
 def approve_plan(authority, plan, operation_id, *, ttl_seconds=30, deadline_seconds=15):
+    _collection_operation(operation_id)
     owner = _owner(authority)
     _validate_plan(plan, now=datetime.now(timezone.utc))
     if not plan["candidate"]["artifact_ids"]:
@@ -367,6 +401,7 @@ def _collect(authority, plan, *, execute, approval_id, operation_id, deadline_se
     _validate_plan(plan)
     ids = plan["candidate"]["artifact_ids"]
     if execute:
+        _collection_operation(operation_id)
         if not ids or _ID.check(approval_id, "approval") or _ID.check(operation_id, "operation"):
             raise ExecutionRefused("execution requires a reviewed nonempty plan, owner approval and operation ID")
         prior = owner.operation_receipts(operation_id, plan["plan_digest"], approval_id, ids)

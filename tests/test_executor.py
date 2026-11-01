@@ -138,6 +138,14 @@ class ManagedApiBoundary(unittest.TestCase):
             self.assertIsNone(caught.exception.__context__)
             self.assertTrue(caught.exception.__suppress_context__)
 
+    def test_managed_plan_schema_represents_keep_only_unknown_identity(self):
+        document = executor.plan_schema()
+        self.assertFalse(document["additionalProperties"])
+        identity = document["properties"]["decisions"]["items"]["properties"]["identity"]
+        self.assertEqual(identity["anyOf"][0], {"type": "null"})
+        self.assertFalse(identity["anyOf"][1]["additionalProperties"])
+        self.assertEqual(set(identity["anyOf"][1]["required"]), set(executor._REGISTERED_IDENTITY))
+
     def test_plan_loader_rejects_duplicate_nonfinite_unknown_and_oversize(self):
         for text in ('{"schema":1,"schema":2}', '{"schema":NaN}', '{"unknown":true}',
                      " " * (executor.MAX_PLAN_BYTES + 1)):
@@ -179,6 +187,94 @@ class RealBrokerCollection(unittest.TestCase):
     def execute(self, plan, grant, **kwargs):
         return executor.collect(self.authority, plan, execute=True,
                                 operation_id=grant["operation_id"], approval_id=grant["approval_id"], **kwargs)
+
+    def test_broker_pending_status_schema_and_recovery_discovery(self):
+        plan = executor.create_plan(self.authority, "task")
+        grant = executor.approve_plan(self.authority, plan, "fixture-collection")
+        with mock.patch.object(Fence, "finish", side_effect=OSError("fixture interrupted durable finish")):
+            result = self.execute(plan, grant)
+        pending = self.authority.pending_operations("task")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["operation_id"], "fixture-collection")
+        self.assertEqual(pending[0]["artifact_id"], result["pending_artifact_ids"][0])
+        self.assertEqual(pending[0]["plan_digest"], plan["plan_digest"])
+        self.assertIn(pending[0]["status"], ("pending", "unknown"))
+        with self.assertRaises((AuthorityError, executor.ExecutionRefused)):
+            executor.create_plan(self.authority, "task")
+        receipt = self.authority.reconcile(pending[0]["operation_id"], pending[0]["artifact_id"])
+        self.assertEqual(receipt["outcome"], "reconciled_missing")
+        self.assertEqual(self.authority.pending_operations(), [])
+
+    def test_reconciled_never_created_tombstone_allows_new_producer_plan(self):
+        credentials = self.authority.register("recover-task", "producer")
+        self.authority.producer_call(credentials, "start", {})
+        original = os.open
+        def fail_blob(path, *a, **kw):
+            if isinstance(path, str) and path.endswith(".blob"):
+                raise OSError("fixture crash before managed file creation")
+            return original(path, *a, **kw)
+        with mock.patch.object(os, "open", fail_blob), self.assertRaises(AuthorityError):
+            self.authority.producer_call(credentials, "write", {"data": "bG9zdCBjcmVhdGU=", "artifact_class": "temp", "disposable": True}, request_id="never-created")
+        pending = self.authority.pending_operations("recover-task")
+        self.assertEqual(len(pending), 1)
+        tombstone_id = pending[0]["artifact_id"]
+        recovered = self.authority.reconcile(pending[0]["operation_id"], tombstone_id)
+        self.assertEqual(recovered["outcome"], "reconciled_missing")
+        fresh = self.authority.resume("recover-task")
+        self.authority.producer_call(fresh, "start", {})
+        ident = self.authority.producer_call(fresh, "write", {"data": "bmV3IG9iamVjdA==", "artifact_class": "temp", "disposable": True})
+        self.authority.producer_call(fresh, "terminal", {"status": "completed"})
+        time.sleep(1.05)
+        plan = executor.create_plan(self.authority, "recover-task")
+        self.assertEqual(plan["candidate"]["artifact_ids"], [ident])
+        retired = next(d for d in plan["decisions"] if d["artifact_id"] == tombstone_id)
+        self.assertEqual(retired["decision"], "KEEP")
+        self.assertIn("retired", retired["reasons"])
+        self.assertIsNone(retired["identity"])
+        self.assertEqual(self.authority.pending_operations(), [])
+
+    def test_absent_retired_inode_reuse_does_not_hide_live_identity_conflict(self):
+        plan = executor.create_plan(self.authority, "task", artifact_ids=[self.ids[0]])
+        grant = executor.approve_plan(self.authority, plan, "fixture-collection")
+        self.execute(plan, grant)
+        original = Fence.snapshot
+        def reused_history(fence):
+            state = original(fence)
+            live = next(x for x in state["inventory"] if x["artifact_id"] == self.ids[1])
+            for item in state["inventory"] + state["artifacts"]:
+                if item["artifact_id"] == self.ids[0]:
+                    item.update(dev=live["dev"], ino=live["ino"])
+            return state
+        with mock.patch.object(Fence, "snapshot", reused_history):
+            observed = executor.create_plan(self.authority, "task")
+        self.assertEqual(observed["candidate"]["artifact_ids"], [self.ids[1]])
+        # A current registered name claiming a DIFFERENT current object's inode
+        # must still fail against independently inspected physical metadata.
+        def forged_live(fence):
+            state = original(fence)
+            live = next(x for x in state["inventory"] if x["artifact_id"] == self.ids[1])
+            for item in state["inventory"] + state["artifacts"]:
+                if item["artifact_id"] == self.protected:
+                    item.update(dev=live["dev"], ino=live["ino"])
+            return state
+        with mock.patch.object(Fence, "snapshot", forged_live), self.assertRaises((executor.ExecutionRefused, AuthorityError)):
+            executor.create_plan(self.authority, "task")
+        self.assertEqual(self.other.read(self.other_id), b"other task canary")
+
+    def test_producer_operation_key_cannot_be_replayed_as_collection(self):
+        from agent_pooper_scooper.authority import producer_operation_id
+        ident = self.other.write(b"collision fixture", request_id="collision-write")
+        self.other.terminal()
+        time.sleep(1.05)
+        plan = executor.create_plan(self.authority, "other", artifact_ids=[ident])
+        operation = producer_operation_id("collision-write")
+        with mock.patch.object(os, "unlink", side_effect=AssertionError("reserved operation effect")):
+            with self.assertRaises(executor.ExecutionRefused):
+                executor.approve_plan(self.authority, plan, operation)
+            with self.assertRaises(executor.ExecutionRefused):
+                executor.collect(self.authority, plan, execute=True, operation_id=operation, approval_id="bogus")
+        record = next(x for x in self.authority.snapshot("other")["artifacts"] if x["artifact_id"] == ident)
+        self.assertEqual((self.base / "store/artifacts" / record["name"]).read_bytes(), b"collision fixture")
 
     def test_default_dry_run_never_prepares_or_unlinks(self):
         plan = executor.create_plan(self.authority, "task")
