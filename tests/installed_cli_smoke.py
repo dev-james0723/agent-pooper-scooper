@@ -38,9 +38,10 @@ class InstalledCliSmoke(unittest.TestCase):
             run("manifest", "init", path, "--task-id", "private-task", "--host", "private-host",
                 "--producer", "fixture", "--root", root)
             run("manifest", "record", path, target, "--class", "temp", "--disposable")
-            history = root / "private-history"
+            history = root / "Private-History"
             history.mkdir()
-            protected_child = history / "output.log"
+            alternate = root / "private-history"
+            protected_child = (alternate if alternate.exists() else history) / "output.log"
             protected_child.write_bytes(b"retained history")
             run("manifest", "record", path, protected_child, "--class", "log", "--disposable")
             run("manifest", "record", path, history, "--class", "session-history")

@@ -50,14 +50,16 @@ def _git_directory(fd):
     return None
 
 
-def _ancestor_git(fd):
+def _ancestor_git(fd, identities=None):
     current = os.dup(fd)
     try:
         for _ in range(disk.DEFAULT_MAX_DEPTH + 1):
+            before = os.fstat(current)
+            if identities is not None:
+                identities.append((before.st_dev, before.st_ino))
             problem = _git_directory(current)
             if problem:
                 return problem
-            before = os.fstat(current)
             parent = os.open("..", disk._DIR_FLAGS, dir_fd=current)
             after = os.fstat(parent)
             os.close(current)
@@ -74,7 +76,8 @@ def _metadata(path):
         parent, name = disk._open_parent(path)
         try:
             st = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            problem = _ancestor_git(parent)
+            ancestors = []
+            problem = _ancestor_git(parent, ancestors)
         finally:
             os.close(parent)
     except OSError:
@@ -82,7 +85,8 @@ def _metadata(path):
     return {"dev": st.st_dev, "ino": st.st_ino, "uid": st.st_uid,
             "mode": st.st_mode, "nlink": st.st_nlink, "size": st.st_size,
             "allocated": getattr(st, "st_blocks", 0) * 512,
-            "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns}, problem
+            "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns,
+            "ancestors": ancestors}, problem
 
 
 def _root_state(root, approval):
@@ -184,12 +188,50 @@ def _build_plan(manifest, adapter=None, *, now=None, task_events=None, public=Fa
                 reasons.append("root_changed_after_evidence")
     retained_paths = {artifact["path"] for artifact in manifest["artifacts"]
                       if artifact["class"] in schema.PROTECTED_CLASSES or not artifact["disposable"]}
+    observations = {}
+
+    def observe(path):
+        if path not in observations:
+            observations[path] = _metadata(path)
+        return observations[path]
+
+    def identity(meta):
+        return meta["dev"], meta["ino"]
+
+    def related(left, right, *, intersects=True):
+        """True/False from observed objects; None means no safe alias proof."""
+        left_meta, left_problem = observe(left)
+        right_meta, right_problem = observe(right)
+        # Literal overlap remains a reason to retain even if observation fails.
+        if (_intersects(left, right) if intersects else _within(right, left)):
+            return True
+        if any(problem or meta is None or not (stat.S_ISREG(meta["mode"]) or stat.S_ISDIR(meta["mode"]))
+               for meta, problem in ((left_meta, left_problem), (right_meta, right_problem))):
+            return None
+        return (identity(left_meta) == identity(right_meta)
+                or identity(left_meta) in right_meta["ancestors"]
+                or (intersects and identity(right_meta) in left_meta["ancestors"]))
+
+    retained_identities = set()
+    for artifact in manifest["artifacts"]:
+        if artifact["path"] not in retained_paths:
+            continue
+        recorded = artifact["dev"], artifact["ino"]
+        retained_identities.add(recorded)
+        meta, problem = observe(artifact["path"])
+        if (problem or meta is None or identity(meta) != recorded
+                or not (stat.S_ISREG(meta["mode"]) or stat.S_ISDIR(meta["mode"]))):
+            global_reasons.append("retained_identity_unverified")
     decisions, states = [], []
     for artifact in manifest["artifacts"]:
         reasons = list(global_reasons)
+        meta, problem = observe(artifact["path"])
         if artifact["class"] in schema.PROTECTED_CLASSES or not artifact["disposable"]:
             reasons.append("protected_or_not_disposable")
-        if any(str(parent) in retained_paths for parent in PurePosixPath(artifact["path"]).parents):
+        if (any(str(parent) in retained_paths for parent in PurePosixPath(artifact["path"]).parents)
+                or (meta and (any(parent in retained_identities for parent in meta["ancestors"])
+                              or (artifact["path"] not in retained_paths
+                                  and identity(meta) in retained_identities)))):
             reasons.append("inside_retained_artifact")
         containing = [r for r in manifest["roots"] if artifact["path"] != r["path"]
                       and _within(artifact["path"], r["path"])]
@@ -205,15 +247,21 @@ def _build_plan(manifest, adapter=None, *, now=None, task_events=None, public=Fa
                 reasons.append("approval_clock_unverified")
             if (now - schema.parse_timestamp(evidence["terminal_at"])).total_seconds() < approval["grace_seconds"]:
                 reasons.append("grace_period")
-            if any(_intersects(root["path"], p) for p in evidence["protected_paths"]):
-                reasons.append("protected_path_intersection")
-            if any(_within(p, root["path"]) for p in evidence["mount_points"]):
-                reasons.append("mount_boundary_or_unknown")
-            if any(_intersects(artifact["path"], r["path"]) for r in evidence["references"]):
-                reasons.append("referenced")
-            if any(_intersects(artifact["path"], lease["path"]) for lease in evidence["leases"]):
-                reasons.append("lease_present")
-        meta, problem = _metadata(artifact["path"])
+            checks = (
+                (root["path"], evidence["protected_paths"], True,
+                 "protected_path_intersection", "protected_path_identity_unverified"),
+                (root["path"], evidence["mount_points"], False,
+                 "mount_boundary_or_unknown", "mount_boundary_or_unknown"),
+                (artifact["path"], [r["path"] for r in evidence["references"]], True,
+                 "referenced", "reference_identity_unverified"),
+                (artifact["path"], [lease["path"] for lease in evidence["leases"]], True,
+                 "lease_present", "lease_identity_unverified"),
+            )
+            for pivot, paths, intersects, matched, unknown in checks:
+                for path in paths:
+                    result = related(pivot, path, intersects=intersects)
+                    if result is not False:
+                        reasons.append(matched if result is True else unknown)
         if problem:
             reasons.append(problem)
         if meta is None:
@@ -251,7 +299,8 @@ def _build_plan(manifest, adapter=None, *, now=None, task_events=None, public=Fa
     evidence_digest = digest_document(evidence) if evidence else None
     state_digest = digest_document({"manifest": digest, "evidence": evidence_digest,
                                     "events": digest_document(task_events) if task_events is not None else None,
-                                    "artifacts": states, "roots": roots, "decisions": decisions})
+                                    "artifacts": states, "roots": roots, "decisions": decisions,
+                                    "path_observations": observations})
     data = {"schema": "agent-pooper-scooper/plan", "schema_version": 1,
             "task_id": manifest["task_id"], "host": manifest["host"],
             "planned_at": schema.format_timestamp(now), "dry_run": True,

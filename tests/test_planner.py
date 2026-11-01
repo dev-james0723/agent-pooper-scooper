@@ -83,6 +83,170 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("evidence_unavailable", data["decisions"][0]["reasons"])
         self.assertEqual(data["candidate"]["count"], 0)
 
+    def alias_artifacts(self):
+        parent = self.root / "Session"
+        parent.mkdir()
+        alias = self.root / "session"
+        if not alias.exists():
+            self.skipTest("fixture filesystem has distinct case-sensitive names")
+        self.assertEqual(parent.stat().st_ino, alias.stat().st_ino)
+        child = alias / "output.log"
+        child.write_bytes(b"keep me")
+        sibling = self.root / "Session-extra"
+        sibling.mkdir()
+        positive = sibling / "output.log"
+        positive.write_bytes(b"y" * 19)
+        for path in (child, positive):
+            manifest.record_artifact(self.path, path, artifact_class="log", disposable=True)
+        return parent, child, positive
+
+    def test_case_alias_protected_ancestors_keep_with_positive_controls(self):
+        from agent_pooper_scooper import report
+        parent, child, positive = self.alias_artifacts()
+        manifest.record_artifact(self.path, parent, artifact_class="session-history", disposable=False)
+        document = manifest.load_manifest(self.path)
+        event = {"schema": schema.TASK_EVENT_SCHEMA, "schema_version": 1, "event_id": "end-1",
+                 "task_id": "task-1", "host": "fixture-host", "producer": "fixture",
+                 "event_type": "task.completed", "occurred_at": self.at(-7200)}
+        for artifact_class in ("session-history", "temp"):
+            for reverse in (False, True):
+                with self.subTest(artifact_class=artifact_class, reverse=reverse):
+                    self.document = copy.deepcopy(document)
+                    for artifact in self.document["artifacts"]:
+                        if artifact["path"] == str(parent):
+                            artifact["class"] = artifact_class
+                    if reverse:
+                        self.document["artifacts"].reverse()
+                    self.evidence["manifest_digest"] = planner.digest_document(self.document)
+                    data = self.plan(task_events=[event])
+                    decisions = {item["path"]: item for item in data["decisions"]}
+                    self.assertEqual(decisions[str(child)]["decision"], "KEEP")
+                    self.assertIn("inside_retained_artifact", decisions[str(child)]["reasons"])
+                    for target in (self.target, positive):
+                        self.assertEqual(decisions[str(target)]["decision"], "WOULD_REMOVE")
+                        self.assertEqual(decisions[str(target)]["reasons"], [])
+                    self.assertEqual(data["candidate"]["apparent_bytes"], 142)
+                    self.assertEqual(data["execution"]["status"], "BLOCKED")
+                    self.assertTrue(planner.revalidate_plan(data, self.document, self.adapter(),
+                                    now=self.now, task_events=[event])["valid"])
+                    linked = report.build_report(self.document, [event], plan=data,
+                                                 evidence_adapter=self.adapter(), now=self.now)
+                    self.assertEqual(linked["eligible"]["apparent_bytes"], 142)
+        self.assertEqual(child.read_bytes(), b"keep me")
+        self.assertEqual(positive.read_bytes(), b"y" * 19)
+
+    def test_case_alias_references_and_leases_keep_with_positive_controls(self):
+        from agent_pooper_scooper import report
+        parent, child, positive = self.alias_artifacts()
+        self.document = manifest.load_manifest(self.path)
+        self.evidence["manifest_digest"] = planner.digest_document(self.document)
+        event = {"schema": schema.TASK_EVENT_SCHEMA, "schema_version": 1, "event_id": "end-1",
+                 "task_id": "task-1", "host": "fixture-host", "producer": "fixture",
+                 "event_type": "task.completed", "occurred_at": self.at(-7200)}
+        def snapshot():
+            return {str(p): (p.stat().st_dev, p.stat().st_ino, p.stat().st_size,
+                             p.stat().st_mtime_ns, p.stat().st_ctime_ns, p.read_bytes())
+                    for p in (self.target, child, positive)}
+        before = snapshot()
+        for field, reason in (("references", "referenced"), ("leases", "lease_present")):
+            for path in (parent, parent / "OUTPUT.LOG"):
+                with self.subTest(field=field, path=path.name):
+                    item = ({"task_id": "other", "state": "resumable"} if field == "references"
+                            else {"lease_id": "other", "state": "expired"})
+                    self.evidence[field] = [dict(item, path=str(path))]
+                    data = self.plan(task_events=[event])
+                    decisions = {item["path"]: item for item in data["decisions"]}
+                    self.assertEqual(decisions[str(child)]["decision"], "KEEP")
+                    self.assertIn(reason, decisions[str(child)]["reasons"])
+                    for target in (self.target, positive):
+                        self.assertEqual(decisions[str(target)]["decision"], "WOULD_REMOVE")
+                    self.assertEqual(data["candidate"]["apparent_bytes"], 142)
+                    self.assertEqual(data["removed"]["bytes"], 0)
+                    self.assertEqual(data["execution"]["status"], "BLOCKED")
+                    self.assertTrue(planner.revalidate_plan(data, self.document, self.adapter(),
+                                    now=self.now, task_events=[event])["valid"])
+                    linked = report.build_report(self.document, [event], plan=data,
+                                                 evidence_adapter=self.adapter(), now=self.now)
+                    self.assertEqual(linked["eligible"]["apparent_bytes"], 142)
+            self.evidence[field] = []
+        self.assertEqual(snapshot(), before)
+
+    def test_case_alias_mount_and_worktree_paths_keep(self):
+        alternate = self.base / "SCRATCH"
+        if not alternate.exists():
+            self.skipTest("fixture filesystem has distinct case-sensitive names")
+        for field, reason in (("protected_paths", "protected_path_intersection"),
+                              ("mount_points", "mount_boundary_or_unknown")):
+            with self.subTest(field=field):
+                self.evidence[field] = [str(alternate)]
+                self.keep(reason)
+                self.evidence[field] = []
+        self.assertEqual(self.plan()["candidate"]["apparent_bytes"], 123)
+
+    def test_unknown_reference_and_lease_identity_keeps(self):
+        link = self.base / "reference-link"
+        link.symlink_to(self.target)
+        for field, reason in (("references", "reference_identity_unverified"),
+                              ("leases", "lease_identity_unverified")):
+            for path in (self.base / "missing-reference", link):
+                with self.subTest(field=field, path=path.name):
+                    item = ({"task_id": "other", "state": "active"} if field == "references"
+                            else {"lease_id": "other", "state": "expired"})
+                    self.evidence[field] = [dict(item, path=str(path))]
+                    self.keep(reason)
+            self.evidence[field] = []
+        self.assertEqual(self.target.read_bytes(), b"x" * 123)
+
+    def test_reference_identity_replacement_invalidates_an_unchanged_decision(self):
+        from agent_pooper_scooper import report
+        reference = self.base / "unrelated-reference"
+        reference.mkdir()
+        self.evidence["references"] = [{"path": str(reference), "task_id": "other", "state": "active"}]
+        data = self.plan()
+        self.assertEqual(data["candidate"]["apparent_bytes"], 123)
+        reference.rename(self.base / "old-reference")
+        reference.mkdir()
+        self.assertEqual(self.plan()["candidate"]["apparent_bytes"], 123)
+        self.assertFalse(planner.revalidate_plan(data, self.document, self.adapter(), now=self.now)["valid"])
+        with self.assertRaises(schema.ValidationError):
+            report.build_report(self.document, plan=data, evidence_adapter=self.adapter(), now=self.now)
+
+    def test_unverified_retained_identity_keeps_unrelated_candidates(self):
+        protected = self.root / "history"
+        protected.mkdir()
+        manifest.record_artifact(self.path, protected, artifact_class="session-history", disposable=False)
+        self.document = manifest.load_manifest(self.path)
+        for artifact in self.document["artifacts"]:
+            if artifact["path"] == str(protected):
+                artifact["ino"] += 1
+        self.evidence["manifest_digest"] = planner.digest_document(self.document)
+        data = self.plan()
+        candidate = next(item for item in data["decisions"] if item["path"] == str(self.target))
+        self.assertEqual(candidate["decision"], "KEEP")
+        self.assertIn("retained_identity_unverified", candidate["reasons"])
+        self.assertEqual(data["candidate"]["count"], 0)
+
+    def test_distinct_case_sensitive_names_are_not_conflated(self):
+        parent = self.root / "Session"
+        parent.mkdir()
+        distinct = self.root / "session"
+        if distinct.exists():
+            self.skipTest("fixture filesystem aliases alternate-case names")
+        distinct.mkdir()
+        child = distinct / "output.log"
+        child.write_bytes(b"candidate")
+        manifest.record_artifact(self.path, parent, artifact_class="session-history", disposable=False)
+        manifest.record_artifact(self.path, child, artifact_class="log", disposable=True)
+        self.document = manifest.load_manifest(self.path)
+        self.evidence["manifest_digest"] = planner.digest_document(self.document)
+        self.evidence["references"] = [{"path": str(parent), "task_id": "other", "state": "active"}]
+        self.evidence["leases"] = [{"path": str(parent), "lease_id": "other", "state": "active"}]
+        data = self.plan()
+        item = next(item for item in data["decisions"] if item["path"] == str(child))
+        self.assertEqual(item["decision"], "WOULD_REMOVE")
+        self.assertEqual(item["reasons"], [])
+        self.assertEqual(data["candidate"]["apparent_bytes"], 132)
+
     def test_explicit_ancestor_protection_overrides_disposable_children(self):
         from agent_pooper_scooper import report
         parent = self.root / "session"
