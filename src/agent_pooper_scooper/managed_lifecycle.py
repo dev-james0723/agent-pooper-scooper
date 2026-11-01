@@ -22,6 +22,7 @@ MAX_RECORDS = 4096
 MAX_WORKFLOWS = 128
 MAX_REPORT = 2 * 1024 * 1024
 MAX_JOURNAL = 16 * 1024 * 1024
+JOURNAL_VERSION = 2
 _FORMAT = "agent-pooper-scooper/lifecycle-journal"
 
 
@@ -74,6 +75,39 @@ def _identity(st):
     return [st.st_dev, st.st_ino]
 
 
+def _journal_parent(owner, path):
+    """Observe physical ancestry before mkdir; external namespace actors excluded."""
+    parent, name = disk._open_parent(path)
+    store = cursor = None
+    try:
+        store = _directory(owner.path)
+        forbidden = _identity(os.fstat(store))
+        cursor = os.dup(parent)
+        for _ in range(65):
+            observed = _identity(os.fstat(cursor))
+            if observed == forbidden:
+                raise LifecycleError("journal must be outside the managed store")
+            above = os.open("..", disk._DIR_FLAGS, dir_fd=cursor)
+            try:
+                above_identity = _identity(os.fstat(above))
+            except BaseException:
+                os.close(above)
+                raise
+            if above_identity == observed:
+                os.close(above)
+                return parent, name
+            os.close(cursor);cursor = above
+        raise LifecycleError("journal ancestry unverified")
+    except BaseException:
+        os.close(parent)
+        raise
+    finally:
+        if cursor is not None:
+            os.close(cursor)
+        if store is not None:
+            os.close(store)
+
+
 def public_result(value):
     """Fixed projection: never publish workflow/request/target identifiers."""
     return {key: value[key] for key in ("status", "report", "report_revision", "removed", "delivery") if key in value}
@@ -86,10 +120,11 @@ class ManagedTaskCoordinator:
     def create(cls, owner, socket_path, journal_path):
         if type(owner) is not ManagedAuthority:
             raise LifecycleError("genuine owner required")
+        owner.pending_operations()  # Public authenticated, recovery-safe read; no journal yet.
         path = os.fspath(journal_path)
         if not os.path.isabs(path) or os.path.normpath(path) != path:
             raise LifecycleError("physical journal path required")
-        parent, name = disk._open_parent(path)
+        parent, name = _journal_parent(owner, path)
         try:
             os.mkdir(name, 0o700, dir_fd=parent)  # Never adopt an existing directory.
         finally:
@@ -103,7 +138,7 @@ class ManagedTaskCoordinator:
                 database = _identity(os.fstat(fd));os.fsync(fd)
             finally:
                 os.close(fd)
-            header = {"schema": _FORMAT, "version": 1, "journal_id": uuid.uuid4().hex,
+            header = {"schema": _FORMAT, "version": JOURNAL_VERSION, "journal_id": uuid.uuid4().hex,
                       "root": _identity(os.fstat(root)), "database": database,
                       "store_root": _identity(os.fstat(store)), "uid": os.getuid()}
             header["mac"] = hmac.new(owner.owner_key.encode(), _json(header).encode(), hashlib.sha256).hexdigest()
@@ -115,7 +150,7 @@ class ManagedTaskCoordinator:
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA fullfsync=ON")
                 conn.execute("CREATE TABLE records (key TEXT PRIMARY KEY, body TEXT NOT NULL)")
-                conn.execute("PRAGMA user_version=1");conn.commit()
+                conn.execute("PRAGMA user_version=2");conn.commit()
             finally:
                 conn.close()
             os.fsync(root)
@@ -134,9 +169,13 @@ class ManagedTaskCoordinator:
         self.journal_id = None
         self._check()
 
-    def _check(self):
+    def _check(self, *, authenticate=True):
         if os.getpid() != self.pid:
             raise LifecycleError("inherited coordinator refused")
+        if authenticate:
+            # This call must precede journal access and never occur while a
+            # journal transaction is held: authority and journal locks stay separate.
+            self.owner.pending_operations()
         root = _directory(self.path);store = None
         try:
             store = _directory(self.owner.path)
@@ -155,7 +194,7 @@ class ManagedTaskCoordinator:
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied, expected):
                 raise LifecycleError("journal owner binding refused")
             db = os.stat("journal.sqlite3", dir_fd=root, follow_symlinks=False)
-            if (header["schema"] != _FORMAT or type(header["version"]) is not int or header["version"] != 1
+            if (header["schema"] != _FORMAT or type(header["version"]) is not int or header["version"] != JOURNAL_VERSION
                     or header["root"] != _identity(os.fstat(root)) or header["database"] != _identity(db)
                     or header["store_root"] != _identity(os.fstat(store)) or header["uid"] != os.getuid()
                     or not stat.S_ISREG(db.st_mode) or db.st_nlink != 1 or db.st_uid != os.getuid()
@@ -177,7 +216,7 @@ class ManagedTaskCoordinator:
         try:
             conn = sqlite3.connect(str(Path(self.path) / "journal.sqlite3"), timeout=1, isolation_level=None)
             conn.execute("PRAGMA synchronous=FULL");conn.execute("PRAGMA fullfsync=ON")
-            if (conn.execute("PRAGMA user_version").fetchone()[0] != 1
+            if (conn.execute("PRAGMA user_version").fetchone()[0] != JOURNAL_VERSION
                     or conn.execute("PRAGMA synchronous").fetchone()[0] != 2
                     or conn.execute("PRAGMA fullfsync").fetchone()[0] != 1
                     or conn.execute("PRAGMA journal_mode").fetchone()[0] != "delete"):
@@ -187,7 +226,7 @@ class ManagedTaskCoordinator:
             if count > MAX_RECORDS or total > MAX_JOURNAL:
                 raise LifecycleError("journal bound exceeded")
             yield conn
-            self._check()
+            self._check(authenticate=False)
             conn.commit()
         except BaseException:
             if conn is not None:
@@ -234,26 +273,31 @@ class ManagedTaskCoordinator:
     def _uncertain(row):
         return row["kind"] == "action" and (row["state"] != "done" or (row["result"] or {}).get("status") == "unknown")
 
+    def _alias(self, conn, domain, slot, binding, request_id):
+        alias = "alias:" + _hash([domain, _id(request_id)])
+        value = {"kind": "alias", "slot": slot, "binding": _hash(binding)}
+        old = self._get(conn, alias)
+        if old is not None and old != value:
+            raise LifecycleError("request payload changed")
+        self._put(conn, alias, value)
+
     def _claim(self, slot, binding, request_id, *, exclusive=False, report=False):
         with self._tx() as conn:
-            alias = "alias:" + _hash(_id(request_id))
-            a = {"kind": "alias", "slot": slot, "binding": _hash(binding)}
-            old = self._get(conn, alias)
-            if old is not None and old != a:
-                raise LifecycleError("request payload changed")
-            self._put(conn, alias, a)
+            self._alias(conn, "stage:" + slot.split(":", 1)[0], slot, binding, request_id)
             row = self._get(conn, slot)
+            # Resume rechecks even a completed replay before entering the broker.
+            # New claims of any exclusive phase cannot cross an unknown phase.
+            if exclusive and (row is None or slot.startswith("resume:")):
+                for key, in conn.execute("SELECT key FROM records WHERE key NOT LIKE 'alias:%'"):
+                    other = self._get(conn, key)
+                    if self._uncertain(other) and other["binding"].get("workflow") == binding.get("workflow"):
+                        raise LifecycleError("workflow outcome unknown")
             if row:
                 if row["kind"] != "action" or row["binding"] != binding:
                     raise LifecycleError("phase binding changed")
                 if row["state"] != "done":
                     raise LifecycleError("pending or unknown phase requires inspection")
                 return row["result"]
-            if exclusive:
-                for key, in conn.execute("SELECT key FROM records WHERE key NOT LIKE 'alias:%'"):
-                    other = self._get(conn, key)
-                    if self._uncertain(other) and other["binding"].get("workflow") == binding.get("workflow"):
-                        raise LifecycleError("workflow outcome unknown")
             if slot.startswith(("enroll:", "resume:")):
                 used = conn.execute("SELECT count(*) FROM records WHERE key LIKE 'workflow:%'").fetchone()[0]
                 pending = 0
@@ -377,6 +421,15 @@ class ManagedTaskCoordinator:
         if type(execute) is not bool or type(send) is not bool:
             raise LifecycleError("explicit mode required")
         workflow = self._workflow(task_id);wid = workflow["workflow_id"]
+        if send:
+            _id(device_id);_id(mission_id)
+            if not callable(callback):
+                raise LifecycleError("explicit transport required before effects")
+        logical = {"workflow": wid, "execute": execute, "plan": _hash(plan) if execute else None,
+                   "approval": approval_id if execute else None, "operation": operation_id if execute else None,
+                   "send": send, "device": device_id if send else None, "mission": mission_id if send else None}
+        with self._tx() as conn:
+            self._alias(conn, "request:task-end", "task-end:" + wid, logical, request_id)
         # A pending invocation is never rerun or upgraded by a task-end request.
         with self._tx() as conn:
             run = self._get(conn, "run:" + wid)
@@ -474,7 +527,7 @@ class ManagedTaskCoordinator:
             if len(matches) != 1:
                 raise LifecycleError("active workflow cannot be resumed")
             prior_slot, row = matches[0]
-            self._claim(prior_slot, row["binding"], request_id)
+            self._claim(prior_slot, row["binding"], request_id, exclusive=True)
             credentials = self.owner.resume(task_id, request_id=self._owner_request(prior_slot))
             if _hash(credentials) != workflow["credential_hash"]:
                 raise LifecycleError("resume replay changed")
@@ -482,7 +535,7 @@ class ManagedTaskCoordinator:
         if snap["task_status"] not in ("completed", "failed", "paused", "resumable"):
             raise LifecycleError("resume state refused")
         slot = "resume:" + wid
-        prior = self._claim(slot, {"workflow": wid}, request_id)
+        prior = self._claim(slot, {"workflow": wid}, request_id, exclusive=True)
         credentials = self.owner.resume(task_id, request_id=self._owner_request(slot))
         snap = self.owner.snapshot(task_id)
         new_id = _hash([snap["store_id"], task_id, credentials["generation"]])

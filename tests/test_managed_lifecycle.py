@@ -1,7 +1,9 @@
 """Cooperating producers generate primary bytes through the real fixture broker."""
+import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import sqlite3
 import sys
 import tempfile
@@ -78,6 +80,87 @@ class ManagedLifecycleTests(unittest.TestCase):
         self.assertEqual(replay["removed"], {"count": 0, "bytes": 0})
         self.assertEqual(replay["report"], result["report"])
         self.assertEqual(self.original.read_bytes(), b"unmanaged original must remain")
+
+    def test_combined_collection_and_delivery_have_separate_substage_aliases(self):
+        self.run_task();time.sleep(1.05)
+        plan = executor.create_plan(self.owner, "private-task")
+        grant = executor.approve_plan(self.owner, plan, "combined-operation")
+        calls = []
+        def ack(name, args):
+            calls.append((name, args))
+            return {"content": [{"type": "text", "text": "Notification sent."}]}
+        kwargs = dict(execute=True, plan=plan, approval_id=grant["approval_id"], operation_id="combined-operation",
+                      send=True, callback=ack, device_id="device", mission_id="mission")
+        result = self.coord.task_end("private-task", "combined", **kwargs)
+        self.assertEqual(result["removed"], {"count": 1, "bytes": 17})
+        self.assertEqual(result["delivery"]["status"], "provider_acknowledged")
+        self.assertEqual(result["report_revision"], 1)
+        self.assertIn("cumulative confirmed removal history", calls[0][1]["message"])
+        with mock.patch.object(executor, "collect", side_effect=AssertionError("second collection")):
+            for alias in ("combined", "new-combined-alias"):
+                replay = self.coord.task_end("private-task", alias, **kwargs)
+                self.assertEqual(replay["removed"], {"count": 0, "bytes": 0})
+                self.assertEqual(replay["report"], result["report"])
+                self.assertEqual(replay["report_revision"], 1)
+                self.assertEqual(replay["delivery"]["status"], "provider_acknowledged")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.original.read_bytes(), b"unmanaged original must remain")
+
+    def test_changed_outer_request_refuses_before_any_new_effect(self):
+        self.run_task()
+        self.coord.task_end("private-task", "fixed-request")
+        time.sleep(1.05)
+        plan = executor.create_plan(self.owner, "private-task")
+        grant = executor.approve_plan(self.owner, plan, "different-request-payload")
+        with mock.patch.object(executor, "collect", side_effect=AssertionError("changed request effect")) as collect:
+            with self.assertRaises(lifecycle.LifecycleError):
+                self.coord.task_end("private-task", "fixed-request", execute=True, plan=plan,
+                                    approval_id=grant["approval_id"], operation_id="different-request-payload")
+            collect.assert_not_called()
+        self.assertEqual(self.owner.accounting_snapshot("private-task")["outcomes"], [])
+
+    def test_missing_send_transport_refuses_before_approved_collection(self):
+        self.run_task();time.sleep(1.05)
+        plan = executor.create_plan(self.owner, "private-task")
+        grant = executor.approve_plan(self.owner, plan, "bad-send-config")
+        with mock.patch.object(executor, "collect", side_effect=AssertionError("known refusal after effect")) as collect:
+            with self.assertRaises(lifecycle.LifecycleError):
+                self.coord.task_end("private-task", "bad-send", execute=True, plan=plan,
+                                    approval_id=grant["approval_id"], operation_id="bad-send-config",
+                                    send=True, device_id="device", mission_id="mission")
+            collect.assert_not_called()
+
+    def test_resume_claim_atomically_refuses_a_concurrent_pending_phase(self):
+        self.run_task()
+        generation = self.owner.snapshot("private-task")["producer_generation"]
+        entered, release = threading.Event(), threading.Event()
+        outputs = []
+        real_claim = self.coord._claim
+        def barrier(slot, *args, **kwargs):
+            if slot.startswith("resume:"):
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError("fixture barrier expired")
+            return real_claim(slot, *args, **kwargs)
+        def resume():
+            try:
+                outputs.append(self.coord.resume("private-task", "resume"))
+            except Exception as exc:
+                outputs.append(exc)
+        with mock.patch.object(self.coord, "_claim", barrier), mock.patch.object(self.owner, "resume", wraps=self.owner.resume) as broker_resume:
+            worker = threading.Thread(target=resume);worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                other = lifecycle.ManagedTaskCoordinator(self.owner, self.server.socket_path, self.path)
+                wid = other._workflow("private-task")["workflow_id"]
+                other._claim("collection:" + wid + ":concurrent", {"workflow": wid}, "concurrent", exclusive=True)
+            finally:
+                release.set();worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outputs), 1)
+            self.assertIsInstance(outputs[0], lifecycle.LifecycleError)
+            broker_resume.assert_not_called()
+        self.assertEqual(self.owner.snapshot("private-task")["producer_generation"], generation)
 
     def test_delivery_slot_pins_target_after_unknown_and_alias_never_resends(self):
         result = self.run_task()
@@ -248,6 +331,17 @@ class ManagedLifecycleTests(unittest.TestCase):
         with self.assertRaises(lifecycle.LifecycleError):
             self.coord.status()
 
+    def test_incompatible_old_development_format_is_not_migrated(self):
+        import hmac
+        path = Path(self.path) / "identity.json"
+        header = json.loads(path.read_bytes());header.pop("mac");header["version"] = 1
+        header["mac"] = hmac.new(self.owner.owner_key.encode(), lifecycle._json(header).encode(), hashlib.sha256).hexdigest()
+        path.write_text(lifecycle._json(header))
+        db = Path(self.path) / "journal.sqlite3";before = db.read_bytes()
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.ManagedTaskCoordinator(self.owner, self.server.socket_path, self.path)
+        self.assertEqual(db.read_bytes(), before)
+
     def test_workflow_capacity_is_reserved_before_broker_enrollment(self):
         before = self.owner.snapshot("private-task")
         with mock.patch.object(lifecycle, "MAX_WORKFLOWS", 1), self.assertRaises(lifecycle.LifecycleError):
@@ -313,6 +407,65 @@ class ManagedLifecycleTests(unittest.TestCase):
         with self.assertRaises(lifecycle.LifecycleError):
             fresh.enroll("private-task", "producer", "new-enrollment-key")
         self.assertEqual(self.owner.snapshot("private-task"), before)
+
+    def test_journal_inside_managed_namespace_refuses_before_creation(self):
+        root = Path(self.owner.path)
+        parents = [root / "artifacts", root / "control", root]
+        alternate = root.with_name(root.name.swapcase())
+        if alternate.is_dir() and alternate.stat().st_ino == root.stat().st_ino:
+            parents.append(alternate / "artifacts")
+        def inventory():
+            return sorted((str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest())
+                          for p in root.rglob("*") if p.is_file())
+        before = inventory();state = self.owner.snapshot("private-task")
+        for parent in parents:
+            with self.subTest(parent=parent.name):
+                path = parent / "workflow-journal"
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.ManagedTaskCoordinator.create(self.owner, self.server.socket_path, str(path))
+                self.assertFalse(path.exists())
+                self.assertEqual(inventory(), before)
+                self.assertEqual(self.owner.snapshot("private-task"), state)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires fixture process fork")
+    def test_inherited_owner_refuses_new_child_coordinator_before_journal_mutation(self):
+        def journal_bytes():
+            return sorted((p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in Path(self.path).iterdir() if p.is_file())
+        before = journal_bytes();child_path = str(self.base / "child-journal")
+        read_fd, write_fd = os.pipe();pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            results = []
+            try:
+                try:
+                    lifecycle.ManagedTaskCoordinator.create(self.owner, self.server.socket_path, child_path)
+                except lifecycle.LifecycleError:
+                    results.append("R")
+                else:
+                    results.append("B")
+                try:
+                    child = lifecycle.ManagedTaskCoordinator(self.owner, self.server.socket_path, self.path)
+                    child.run_producer(self.client, lambda _: None, "child-run")
+                except lifecycle.LifecycleError:
+                    results.append("R")
+                else:
+                    results.append("B")
+                os.write(write_fd, "".join(results).encode())
+            finally:
+                os._exit(0)
+        os.close(write_fd)
+        try:
+            ready = select.select([read_fd], [], [], 5)[0]
+            if not ready:
+                os.kill(pid, 9)  # Only this test's bounded child.
+            self.assertTrue(ready, "fixture child did not finish")
+            self.assertEqual(os.read(read_fd, 16), b"RR")
+        finally:
+            os.close(read_fd);os.waitpid(pid, 0)
+        self.assertFalse(Path(child_path).exists())
+        self.assertEqual(journal_bytes(), before)
+        self.assertEqual(self.coord.status()["status"], "recorded")
+        self.assertEqual(self.run_task()["report"]["generated"]["apparent_bytes"], 40)
 
     def test_journal_and_public_projection_do_not_cache_payload_or_capabilities(self):
         sentinel = b"private-artifact-body-unique-sentinel"

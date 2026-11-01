@@ -39,6 +39,10 @@ completion. Native session status/PID/preflight is not that completion.
 
 Workflow identity is store ID, task ID and enrollment generation. Request IDs
 are exact-payload replay aliases, not new workflows or effect permission.
+The outer task-end request binds preview/collection/delivery parameters before
+effects. Internal substages have separate alias domains, so one approved
+collection-and-delivery request can complete without colliding with itself.
+Canonical effect, report and delivery slots do not change with those aliases.
 Registration/resume replay keys also bind the authenticated journal ID. A
 fresh/unbound journal cannot recover or adopt another journal's enrollment.
 
@@ -62,6 +66,15 @@ again. Old credentials and retired IDs are never restored.
 The exclusive directory is 0700 and files are 0600. Reopen validates physical
 no-follow root/database identity, ownership, format, store-root binding and
 owner HMAC. Every record is authenticated and bound to its journal and key.
+Journal format 2 refuses incompatible format-1 development journals; it never
+migrates or adopts their former alias bindings. Before any journal access, the
+existing public `owner.pending_operations()` validates current owner lifecycle,
+including inherited-owner refusal, without recording its returned metadata.
+This logically read-only guard uses the existing authority connection behavior.
+It runs before journal transactions; post-yield identity checks do not call the
+broker. Before mkdir, a bounded physical parent-FD walk rejects store/control/
+artifacts ancestry and case aliases by device/inode identity. Unknown ancestry
+refuses; no cleanup or repair of an unknown managed entry is attempted.
 The implementation uses documented trusted-owner `owner_key`/`path` attributes
 and existing public register/snapshot/resume/receipt APIs; it never reads or
 edits authority SQL/private state. No authority API or effect primitive changes.
@@ -75,6 +88,8 @@ intentional stored DTO. Public projection omits workflow/phase/target IDs.
 SQLite phase claims serialize competing callers. Intent commits precede
 invocation, terminal/resume/collection and dispatch. No journal transaction
 spans broker or network calls; no atomicity across databases is claimed.
+Resume atomically rechecks workflow exclusivity when claiming its phase, before
+entering the broker, including a completed-credential replay.
 Unconfirmed stage completion stops mutation and remains inspect-only. A fresh
 request ID, timestamp, grant refresh or replacement journal cannot hide it.
 Underlying authority recovery remains authoritative. Status does not repair
