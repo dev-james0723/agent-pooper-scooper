@@ -442,6 +442,8 @@ class FenceAndCrashIntegration(unittest.TestCase):
         script = r"""
 import json,os,sys
 from unittest import mock
+# Load this test snapshot's source without ambient PYTHONPATH or installation.
+sys.path.insert(0,sys.argv[2])
 from agent_pooper_scooper.authority import ManagedAuthority,Fence
 from agent_pooper_scooper import executor,executor_platform
 job=json.load(open(sys.argv[1]));stage=job['stage']
@@ -480,7 +482,9 @@ os._exit(99)
                 job = self.base / (stage + ".json")
                 job.write_text(json.dumps({"stage": stage, "store": owner.path, "key": owner.owner_key, "plan": plan, "grant": grant}))
                 job.chmod(0o600)
-                child = subprocess.run([sys.executable, "-B", "-c", script, str(job)], timeout=8, capture_output=True)
+                child = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(job),
+                                        str(Path(__file__).resolve().parents[1] / "src")],
+                                       timeout=8, capture_output=True)
                 self.assertEqual(child.returncode, index, child.stderr)
                 reopened = ManagedAuthority(owner.path, owner_key=owner.owner_key)
                 if stage == "finish":
