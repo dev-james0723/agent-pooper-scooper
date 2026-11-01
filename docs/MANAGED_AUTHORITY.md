@@ -138,6 +138,39 @@ Fence checks repeat their deadline test after their own identity/DB observations
 
 ## Research basis
 
+## Read-only managed accounting
+
+Trusted owner `accounting_snapshot(task_id)` returns factual DTO schema
+`agent-pooper-scooper/managed-accounting`, version 1. One existing authority lock
+covers selected-task registry facts, durable creation/retirement records and
+anchored no-follow metadata observations. It works during recovery, performs no
+commit, grants no deletion and has no producer RPC route. Cleanup primitives
+and collector approval/fencing semantics are unchanged.
+
+Artifacts expose only the agreed accounting whitelist: opaque ID, class and
+policy, lifecycle flags/generation/time, nullable six-field identity, verified
+creation size/allocation, current verification status/nullable size/allocation,
+and counts of all reference/lease holders including expired claims. Historical
+creation bytes require a matching durable completed-create record plus final
+registration identity and origin. Pending/unmaterialized/reconciled incomplete
+creates remain unverified with null historical bytes. A current missing or
+changed file never supplies invented current size.
+
+Retirement outcomes check selected task/store/object, exact operation/plan/
+approval/identity bindings and canonical confirmed unlink bytes. Producer-create
+records are not retirement. Pending, unknown and reconciled-missing causality
+never become verified removed bytes. Audit entries are bounded derived views of
+existing records, not new writes; unavailable persisted event times stay null.
+Safe fixed-code unknowns and `complete` qualify downstream lower-bound totals.
+
+The view is bounded to 1,024 artifacts and 2,048 outcomes/audit entries, with
+bounded metadata and unknowns; excess refuses instead of truncating silently.
+It exports no filesystem paths/names, payload, capability/key, socket or native
+provider identifiers. Reporting code owns totals and public projections. This
+read API itself is neither a cleanup action nor a task-end/native callback.
+
+## Research basis
+
 The independent research pass inspected containerd v2.4.2
 [`b7a25261`](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/core/metadata/db.go)
 and BuildKit v0.34.1

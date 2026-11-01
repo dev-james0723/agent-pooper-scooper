@@ -587,6 +587,150 @@ class ManagedAuthority:
             result["pending_operations"] = self._pending(conn, state, task_id)
             return result
 
+    def accounting_snapshot(self, task_id):
+        """Owner-only factual view. No commit, producer route or execution grant."""
+        def metadata(raw):
+            if not isinstance(raw, str) or len(raw) > 65536:
+                return None
+            try:
+                value = _strict_json(raw)
+            except (ValueError, TypeError, RecursionError):
+                return None
+            return value if isinstance(value, dict) else None
+
+        def identity(item):
+            values = {k: item.get(k) for k in IDENTITY_FIELDS}
+            return values if all(type(v) is int and v >= 0 for v in values.values()) else None
+
+        def timestamp(value):
+            return value if isinstance(value, str) and schema.parse_timestamp(value) is not None else None
+
+        with self._locked() as (conn, state, root, deadline):
+            task_id = _id(task_id)
+            task = state["tasks"].get(task_id)
+            if task is None:
+                raise AuthorityError("unknown_task")
+            selected = {key: value for key, value in state["artifacts"].items() if value["task_id"] == task_id}
+            if len(selected) > MAX_OBJECTS:
+                raise AuthorityError("accounting_bounds_exceeded")
+            rows = conn.execute("SELECT operation,artifact,substr(body,1,65537),outcome,substr(receipt,1,65537) FROM intents ORDER BY operation,artifact LIMIT ?", (2 * MAX_OBJECTS + 1,)).fetchall()
+            if len(rows) > 2 * MAX_OBJECTS:
+                raise AuthorityError("accounting_bounds_exceeded")
+            ledger = {key: [] for key in selected}
+            for operation, artifact, raw, outcome, receipt in rows:
+                if artifact in ledger:
+                    ledger[artifact].append((operation, metadata(raw), outcome, metadata(receipt)))
+            result = {"schema": "agent-pooper-scooper/managed-accounting", "schema_version": 1,
+                      "store_id": state["store_id"], "task_id": task_id, "revision": state["revision"],
+                      "task_status": task["status"], "observed_at": _iso(),
+                      "recovery_required": state["recovery_required"], "artifacts": [], "outcomes": [],
+                      "unknowns": [], "audit": [], "complete": False}
+            grants = {}
+            def unknown(artifact, reason):
+                if len(result["unknowns"]) >= 2 * MAX_OBJECTS:
+                    raise AuthorityError("accounting_bounds_exceeded")
+                result["unknowns"].append({"artifact_id": artifact, "reason": reason})
+
+            for artifact, item in sorted(selected.items()):
+                if time.monotonic() >= deadline:
+                    raise AuthorityError("accounting_deadline")
+                registered = (item.get("artifact_id") == artifact and item.get("origin_store_id") == state["store_id"]
+                              and type(item.get("origin_generation")) is int and 0 < item["origin_generation"] <= task["generation"]
+                              and isinstance(item.get("name"), str) and re.fullmatch(r"[0-9a-f]{32}\.blob", item["name"])
+                              and item["name"] == artifact + ".blob")
+                pre = identity(item)
+                allocation = item.get("allocated_bytes")
+                allocation = allocation if type(allocation) is int and allocation >= 0 else None
+                creates = [row for row in ledger[artifact] if row[1] and row[1].get("kind") == "producer_create"]
+                verified = False
+                if registered and pre and allocation is not None and len(creates) == 1:
+                    operation, body, outcome, receipt = creates[0]
+                    initial = body.get("expected_identity")
+                    verified = bool(re.fullmatch(r"producer:[0-9a-f]{64}", operation) and outcome == "created"
+                                    and receipt and receipt.get("outcome") == "created" and receipt.get("artifact_id") == artifact
+                                    and body.get("artifact_id") == artifact and body.get("name") == item["name"]
+                                    and isinstance(initial, dict) and all(initial.get(k) == pre[k] for k in ("dev", "ino", "uid")))
+                if not verified:
+                    unknown(artifact, "creation_unverified")
+                current, size, blocks = "unknown", None, None
+                if registered and pre:
+                    try:
+                        st = os.stat(item["name"], dir_fd=root, follow_symlinks=False)
+                    except FileNotFoundError:
+                        current = "missing"
+                    except OSError:
+                        current = "unknown"
+                    else:
+                        if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == state["root"]["uid"]
+                                and st.st_dev == state["root"]["dev"] and _identity(st) == pre):
+                            current, size, blocks = "present_verified", st.st_size, getattr(st, "st_blocks", 0) * 512
+                        else:
+                            current = "changed"
+                elif registered:
+                    try:
+                        os.stat(item["name"], dir_fd=root, follow_symlinks=False)
+                    except FileNotFoundError:
+                        current = "missing"
+                    except OSError:
+                        pass
+                claims = [claim for claim in state["claims"].values() if claim["artifact_id"] == artifact]
+                result["artifacts"].append({"artifact_id": artifact, "class": item["class"], "disposable": item["disposable"],
+                    "retired": item["retired"], "pending": item.get("pending", False), "origin_generation": item["origin_generation"],
+                    "created_at": timestamp(item.get("created_at")), "identity": pre, "creation_verified": verified,
+                    "created_bytes": pre["size"] if verified else None, "created_allocated_bytes": allocation if verified else None,
+                    "current_status": current, "current_bytes": size, "current_allocated_bytes": blocks,
+                    "reference_count": sum(c["kind"] == "reference" for c in claims), "lease_count": sum(c["kind"] == "lease" for c in claims)})
+                result["audit"].append({"event": "creation", "artifact_id": artifact, "operation_id": creates[0][0] if len(creates) == 1 else None,
+                                        "status": "verified" if verified else "unverified", "at": None})
+                confirmed_missing = False
+                for operation, body, outcome, receipt in ledger[artifact]:
+                    if operation.startswith("producer:") or (body and body.get("kind") == "producer_create"):
+                        continue
+                    binding = False
+                    if body and body.get("kind") == "retirement" and registered and pre:
+                        approval_id = body.get("approval_id")
+                        if isinstance(approval_id, str) and approval_id not in grants:
+                            row = conn.execute("SELECT substr(body,1,65537) FROM approvals WHERE id=?", (approval_id,)).fetchone()
+                            grants[approval_id] = metadata(row[0]) if row else None
+                        grant = grants.get(approval_id) if isinstance(approval_id, str) else None
+                        binding = bool(grant and body.get("store_id") == state["store_id"] and body.get("task_id") == task_id
+                            and body.get("artifact_id") == artifact and body.get("operation_id") == operation
+                            and body.get("expected_identity") == pre and grant.get("store_id") == state["store_id"]
+                            and grant.get("task_id") == task_id and grant.get("approval_id") == approval_id
+                            and grant.get("operation_id") == operation and grant.get("plan_digest") == body.get("plan_digest")
+                            and isinstance(grant.get("artifact_ids"), list) and artifact in grant["artifact_ids"]
+                            and len(grant["artifact_ids"]) <= MAX_OBJECTS and all(isinstance(x, str) for x in grant["artifact_ids"])
+                            and len(set(grant["artifact_ids"])) == len(grant["artifact_ids"])
+                            and all(state["artifacts"].get(x, {}).get("task_id") == task_id for x in grant["artifact_ids"])
+                            and isinstance(body.get("plan_digest"), str) and re.fullmatch(r"[0-9a-f]{64}", body["plan_digest"]))
+                    allowed = {"pending", "unlinked", "not_removed", "unknown", "reconciled_missing", "reconciled_present"}
+                    safe_outcome = outcome if outcome in allowed else "unknown"
+                    if outcome != "pending":
+                        binding = bool(binding and receipt and receipt.get("outcome") == outcome
+                            and all(receipt.get(k) == body.get(k) for k in ("store_id", "operation_id", "artifact_id", "plan_digest"))
+                            and receipt.get("identity") == pre)
+                    removed = None
+                    if binding and outcome == "unlinked":
+                        binding = type(receipt.get("removed_bytes")) is int and receipt["removed_bytes"] == pre["size"]
+                        if binding:
+                            removed = pre["size"]; confirmed_missing = True
+                    elif binding and outcome == "not_removed":
+                        binding = type(receipt.get("removed_bytes")) is int and receipt["removed_bytes"] == 0
+                        removed = 0 if binding else None
+                    if not binding or outcome in ("pending", "unknown", "reconciled_missing", "reconciled_present"):
+                        unknown(artifact, "retirement_unverified" if not binding else "retirement_uncertain")
+                    at = timestamp(receipt.get("at")) if receipt and binding else None
+                    result["outcomes"].append({"operation_id": operation, "artifact_id": artifact, "outcome": safe_outcome,
+                                               "binding_verified": binding, "removed_bytes": removed, "at": at})
+                    result["audit"].append({"event": "retirement", "artifact_id": artifact, "operation_id": operation,
+                                            "status": safe_outcome if binding else "unverified", "at": at})
+                if current in ("changed", "unknown") or (current == "missing" and not confirmed_missing and verified):
+                    unknown(artifact, "current_identity_unverified")
+            if len(result["outcomes"]) > 2 * MAX_OBJECTS or len(result["audit"]) > 2 * MAX_OBJECTS:
+                raise AuthorityError("accounting_bounds_exceeded")
+            result["complete"] = not result["unknowns"] and not state["recovery_required"]
+            return copy.deepcopy(result)
+
     @staticmethod
     def _pending(conn, state, task_id=None):
         if task_id is not None:
