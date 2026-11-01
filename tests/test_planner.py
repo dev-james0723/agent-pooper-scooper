@@ -311,8 +311,110 @@ class PlannerTests(unittest.TestCase):
         self.keep("root_identity_changed")
 
     def test_broad_home_root_is_not_dedicated_scratch(self):
-        with mock.patch.object(os.path, "expanduser", return_value=str(self.root)):
+        with mock.patch.object(os.path, "expanduser", return_value=str(self.root)), \
+                mock.patch.object(planner.disk, "walk_usage") as walk:
             self.keep("root_scope_too_broad")
+            walk.assert_not_called()
+
+    def use_alternate_root_spelling(self):
+        alternate = self.base / "SCRATCH"
+        if not alternate.exists():
+            self.skipTest("fixture filesystem has distinct case-sensitive names")
+        self.document["roots"][0]["path"] = str(alternate)
+        self.document["artifacts"][0]["path"] = str(alternate / self.target.name)
+        self.evidence["approved_roots"][0]["path"] = str(alternate)
+        self.evidence["manifest_digest"] = planner.digest_document(self.document)
+
+    def test_case_alias_of_home_root_is_rejected_without_scan(self):
+        self.use_alternate_root_spelling()
+        with mock.patch.object(os.path, "expanduser", return_value=str(self.root)), \
+                mock.patch.object(planner, "BROAD_ROOT_PATHS", (), create=True), \
+                mock.patch.object(planner.disk, "walk_usage", wraps=planner.disk.walk_usage) as walk:
+            self.keep("root_scope_too_broad")
+            walk.assert_not_called()
+        self.assertEqual(self.target.read_bytes(), b"x" * 123)
+
+    def test_case_alias_of_other_broad_root_is_rejected_without_scan(self):
+        self.use_alternate_root_spelling()
+        home = self.base / "mock-home"
+        home.mkdir()
+        with mock.patch.object(os.path, "expanduser", return_value=str(home)), \
+                mock.patch.object(planner, "BROAD_ROOT_PATHS", (str(self.root),), create=True), \
+                mock.patch.object(planner.disk, "walk_usage", wraps=planner.disk.walk_usage) as walk:
+            self.keep("root_scope_too_broad")
+            walk.assert_not_called()
+
+    def test_root_scope_allows_home_descendants_and_unrelated_scratch(self):
+        from agent_pooper_scooper import report
+        unrelated_home = self.base / "mock-home"
+        unrelated_home.mkdir()
+        event = {"schema": schema.TASK_EVENT_SCHEMA, "schema_version": 1, "event_id": "end-1",
+                 "task_id": "task-1", "host": "fixture-host", "producer": "fixture",
+                 "event_type": "task.completed", "occurred_at": self.at(-7200)}
+        before = (self.target.stat().st_ino, self.target.stat().st_mtime_ns, self.target.read_bytes())
+        for home in (self.base, unrelated_home):
+            with self.subTest(home=home.name), \
+                    mock.patch.object(os.path, "expanduser", return_value=str(home)), \
+                    mock.patch.object(planner, "BROAD_ROOT_PATHS", (), create=True), \
+                    mock.patch.object(planner.disk, "walk_usage", wraps=planner.disk.walk_usage) as walk:
+                data = self.plan(task_events=[event])
+                self.assertEqual(data["candidate"]["apparent_bytes"], 123)
+                self.assertEqual(data["execution"]["status"], "BLOCKED")
+                self.assertTrue(planner.revalidate_plan(data, self.document, self.adapter(),
+                                now=self.now, task_events=[event])["valid"])
+                linked = report.build_report(self.document, [event], plan=data,
+                                             evidence_adapter=self.adapter(), now=self.now)
+                self.assertEqual(linked["eligible"]["apparent_bytes"], 123)
+                self.assertTrue(walk.called)
+                self.assertTrue(all(call.args[0] in {str(self.root), str(self.target)}
+                                    for call in walk.call_args_list))
+        self.assertEqual((self.target.stat().st_ino, self.target.stat().st_mtime_ns,
+                          self.target.read_bytes()), before)
+
+    def test_unknown_home_identity_keeps_without_scan(self):
+        home = self.base / "mock-home"
+        home.mkdir()
+        linked = self.base / "linked-home"
+        linked.symlink_to(home, target_is_directory=True)
+        original = planner.disk._open_parent
+        def refused(path):
+            if str(path) == str(home):
+                raise PermissionError("fixture scope refusal")
+            return original(path)
+        for path, opener in ((self.base / "missing-home", original), (linked, original), (home, refused)):
+            with self.subTest(path=path.name), \
+                    mock.patch.object(os.path, "expanduser", return_value=str(path)), \
+                    mock.patch.object(planner, "BROAD_ROOT_PATHS", (), create=True), \
+                    mock.patch.object(planner.disk, "_open_parent", side_effect=opener), \
+                    mock.patch.object(planner.disk, "walk_usage", wraps=planner.disk.walk_usage) as walk:
+                self.keep("root_scope_unverified")
+                walk.assert_not_called()
+
+    def test_changed_home_identity_invalidates_plan_and_report(self):
+        from agent_pooper_scooper import report
+        home = self.base / "mock-home"
+        home.mkdir()
+        with mock.patch.object(os.path, "expanduser", return_value=str(home)), \
+                mock.patch.object(planner, "BROAD_ROOT_PATHS", (), create=True):
+            data = self.plan()
+            self.assertEqual(data["candidate"]["apparent_bytes"], 123)
+            home.rename(self.base / "old-home")
+            home.mkdir()
+            self.assertEqual(self.plan()["candidate"]["apparent_bytes"], 123)
+            self.assertFalse(planner.revalidate_plan(data, self.document, self.adapter(), now=self.now)["valid"])
+            with self.assertRaises(schema.ValidationError):
+                report.build_report(self.document, plan=data, evidence_adapter=self.adapter(), now=self.now)
+
+    def test_distinct_case_sensitive_home_is_not_broad_root(self):
+        home = self.base / "SCRATCH"
+        if home.exists():
+            self.skipTest("fixture filesystem aliases alternate-case names")
+        home.mkdir()
+        with mock.patch.object(os.path, "expanduser", return_value=str(home)), \
+                mock.patch.object(planner, "BROAD_ROOT_PATHS", (), create=True):
+            data = self.plan()
+            self.assertEqual(data["candidate"]["apparent_bytes"], 123)
+            self.assertEqual(data["decisions"][0]["reasons"], [])
 
     def test_changed_file_identity_and_owner_are_kept(self):
         self.document["artifacts"][0]["ino"] += 1

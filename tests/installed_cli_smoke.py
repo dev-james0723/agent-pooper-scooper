@@ -105,6 +105,37 @@ class InstalledCliSmoke(unittest.TestCase):
             run("task-end", path, "--events", linked, "--public", expected=1)
             self.assertEqual(target.read_bytes(), b"p" * 17)
             self.assertEqual(protected_child.read_bytes(), b"retained history")
+            # Mock HOME in the installed process without changing environment/config.
+            selected = base / "SCRATCH"
+            if not selected.exists():
+                selected = root
+            scoped = json.loads(path.read_text(encoding="utf-8"))
+            scoped["roots"][0]["path"] = str(selected)
+            for artifact in scoped["artifacts"]:
+                artifact["path"] = str(selected / Path(artifact["path"]).relative_to(root))
+            scoped_path = base / "scoped-manifest.json"
+            scoped_path.write_text(json.dumps(scoped), encoding="utf-8")
+            snapshot = dict(evidence, references_complete=True)
+            snapshot["approved_roots"] = [dict(evidence["approved_roots"][0], path=str(selected))]
+            snapshot["manifest_digest"] = hashlib.sha256(json.dumps(
+                scoped, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            scoped_evidence = base / "scoped-evidence.json"
+            scoped_evidence.write_text(json.dumps(snapshot), encoding="utf-8")
+            script = ("import sys; from unittest import mock; "
+                      "from agent_pooper_scooper import cli,disk\n"
+                      "with mock.patch('os.path.expanduser', return_value=sys.argv[3]), "
+                      "mock.patch.object(disk,'walk_usage',side_effect=AssertionError('fixture home scan forbidden')):\n"
+                      " raise SystemExit(cli.main(['plan',sys.argv[1],'--evidence',sys.argv[2],'--public']))\n")
+            process = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+                                      str(scoped_path), str(scoped_evidence), str(root)],
+                                     cwd=base, env=environment, text=True, capture_output=True, timeout=30)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertNotIn(str(base), process.stdout + process.stderr)
+            refused = json.loads(process.stdout)
+            self.assertEqual(refused["candidate"]["count"], 0)
+            self.assertTrue(all("root_scope_too_broad" in item["reasons"] for item in refused["decisions"]))
+            self.assertEqual(refused["execution"]["status"], "BLOCKED")
+            self.assertEqual(protected_child.read_bytes(), b"retained history")
 
     def test_installed_observe_only_workflow(self):
         self.assertIsNotNone(APS, "pass the installed aps executable")

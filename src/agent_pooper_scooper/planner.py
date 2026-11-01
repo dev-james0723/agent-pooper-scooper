@@ -1,5 +1,6 @@
 """Conservative regular-file planner. Execution is unconditionally blocked."""
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -10,6 +11,8 @@ from . import adapters, disk, events, schema
 
 MAX_SNAPSHOT_AGE_SECONDS = 300
 ROOT_SCAN_ENTRIES = 10_000
+BROAD_ROOT_PATHS = ("/", "/Users", "/home", "/tmp", "/private/tmp", "/var",
+                    "/private/var", "/var/tmp", "/private/var/tmp")
 EXECUTION_BLOCKERS = (
     "atomic_identity_delete_unavailable", "complete_platform_mount_proof_unverified",
     "authoritative_live_reference_adapter_unavailable",
@@ -89,12 +92,53 @@ def _metadata(path):
             "ancestors": ancestors}, problem
 
 
+def _root_scope_identity(path):
+    """Inspect a forbidden directory's identity without walking it or following links."""
+    if not os.path.isabs(path):
+        return {"status": "unknown"}
+    try:
+        parent, name = disk._open_parent(path)
+        try:
+            st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        finally:
+            os.close(parent)
+    except FileNotFoundError:
+        return {"status": "absent"}
+    except OSError as exc:
+        return {"status": "not_directory" if exc.errno in (errno.ELOOP, errno.ENOTDIR) else "unknown"}
+    if not stat.S_ISDIR(st.st_mode):
+        return {"status": "not_directory"}
+    return {"status": "directory", "dev": st.st_dev, "ino": st.st_ino}
+
+
+def _root_scope(path, meta):
+    home = os.path.expanduser("~")
+    forbidden = set(BROAD_ROOT_PATHS) | {home}
+    if path in forbidden:
+        return ["root_scope_too_broad"], {"literal": path, "home": home}
+    if meta is None or not stat.S_ISDIR(meta["mode"]):
+        return ["root_scope_unverified"], {}
+    observations, reasons = {}, []
+    for forbidden_path in sorted(forbidden):
+        observed = _root_scope_identity(forbidden_path)
+        observations[forbidden_path] = observed
+        if observed["status"] == "directory":
+            if (observed["dev"], observed["ino"]) == (meta["dev"], meta["ino"]):
+                reasons.append("root_scope_too_broad")
+        elif observed["status"] == "unknown" or forbidden_path == home:
+            reasons.append("root_scope_unverified")
+        # Absent/non-directory built-ins cannot be admitted physical directory
+        # roots. Their physical macOS spellings are listed independently.
+    return reasons, observations
+
+
 def _root_state(root, approval):
     meta, problem = _metadata(root["path"])
     reasons = [problem] if problem else []
-    if root["path"] in {"/", "/Users", "/home", os.path.expanduser("~"), "/tmp", "/private/tmp",
-                         "/var", "/private/var", "/var/tmp", "/private/var/tmp"}:
-        reasons.append("root_scope_too_broad")
+    scope_reasons, scope_observations = _root_scope(root["path"], meta)
+    reasons.extend(scope_reasons)
+    if meta is not None:
+        meta["scope_observations"] = scope_observations
     if not approval["approved"]:
         reasons.append("root_not_approved")
     if (meta is None or not stat.S_ISDIR(meta["mode"])
