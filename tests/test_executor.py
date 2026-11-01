@@ -2,6 +2,9 @@
 import copy
 import json
 import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 import tempfile
 import time
@@ -249,6 +252,185 @@ class RealBrokerCollection(unittest.TestCase):
         self.assertIsNone(reconciled["removed_bytes"])
         self.assertEqual(self.other.read(self.other_id), b"other task canary")
         self.assertEqual(paths[self.protected].read_bytes(), b"protected history")
+
+
+class FenceAndCrashIntegration(unittest.TestCase):
+    setUp = RealBrokerCollection.setUp
+    paths = RealBrokerCollection.paths
+    approved = RealBrokerCollection.approved
+    execute = RealBrokerCollection.execute
+
+    def test_socket_threads_and_fresh_process_cannot_enter_across_prepare_and_finish_commits(self):
+        plan = executor.create_plan(self.authority, "task", artifact_ids=[self.ids[0]])
+        grant = executor.approve_plan(self.authority, plan, "fixture-collection")
+        prepared, prepared_release, finished, finished_release = [threading.Event() for _ in range(4)]
+        original_prepare, original_finish = Fence.prepare, Fence.finish
+        outcome = []
+
+        def prepare(fence, *args, **kwargs):
+            value = original_prepare(fence, *args, **kwargs)
+            prepared.set()
+            if not prepared_release.wait(8):
+                raise RuntimeError("fixture prepare barrier expired")
+            return value
+
+        def finish(fence, *args, **kwargs):
+            value = original_finish(fence, *args, **kwargs)
+            finished.set()
+            if not finished_release.wait(8):
+                raise RuntimeError("fixture finish barrier expired")
+            return value
+
+        def collect():
+            try:
+                outcome.append(self.execute(plan, grant))
+            except Exception as exc:
+                outcome.append(exc)
+
+        def assert_excluded():
+            requests = [("read", {"artifact_id": self.other_id}),
+                        ("write", {"data": "cXVldWVk", "artifact_class": "temp", "disposable": True}),
+                        ("reference", {"artifact_id": self.ids[1], "claim_id": None}),
+                        ("lease", {"artifact_id": self.ids[1], "lease_id": None, "expires_at": None}),
+                        ("resume", {"owner_key": self.authority.owner_key, "task_id": "other"})]
+            results = []
+            def request(method, params):
+                try:
+                    client = ProducerClient(self.server.socket_path, self.other.credentials, timeout=.4)
+                    results.append(client.request(method, params))
+                except AuthorityError as exc:
+                    results.append(exc)
+            workers = [threading.Thread(target=request, args=row) for row in requests]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(len(results), 5)
+            self.assertTrue(all(isinstance(value, AuthorityError) for value in results), results)
+            with self.assertRaises(AuthorityError):
+                self.authority.producer_call(self.other.credentials, "read", {"artifact_id": self.other_id},
+                                             deadline=time.monotonic() + .05)
+            # This child has no Authority/mutex; it opens a distinct OS lock fd.
+            code = "import fcntl,os,sys;fd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW);\ntry:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:sys.exit(0)\nsys.exit(1)"
+            child = subprocess.run([sys.executable, "-B", "-c", code, str(self.base / "store/control/lock")], timeout=3, capture_output=True)
+            self.assertEqual(child.returncode, 0, child.stderr)
+
+        with mock.patch.object(Fence, "prepare", prepare), mock.patch.object(Fence, "finish", finish):
+            worker = threading.Thread(target=collect)
+            worker.start()
+            try:
+                self.assertTrue(prepared.wait(3))
+                assert_excluded()
+                prepared_release.set()
+                self.assertTrue(finished.wait(3))
+                assert_excluded()
+            finally:
+                prepared_release.set()
+                finished_release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], dict, outcome)
+        self.assertEqual(outcome[0]["removed"], {"count": 1, "bytes": 17})
+        self.assertEqual(self.other.read(self.other_id), b"other task canary")
+
+    def test_crash_receipts_at_each_effect_boundary_never_blindly_replay(self):
+        # Each subcase starts an independent CREATED store; no existing data is adopted.
+        script = r"""
+import json,os,sys
+from unittest import mock
+from agent_pooper_scooper.authority import ManagedAuthority,Fence
+from agent_pooper_scooper import executor,executor_platform
+job=json.load(open(sys.argv[1]));stage=job['stage']
+owner=ManagedAuthority(job['store'],owner_key=job['key'])
+real_prepare,real_unlink,real_sync,real_finish=Fence.prepare,os.unlink,executor_platform.sync_directory,Fence.finish
+def prepare(fence,*a,**kw):
+    result=real_prepare(fence,*a,**kw)
+    if stage=='prepare':os._exit(71)
+    return result
+def unlink(*a,**kw):
+    result=real_unlink(*a,**kw)
+    if stage=='unlink':os._exit(72)
+    return result
+def sync(*a,**kw):
+    result=real_sync(*a,**kw)
+    if stage=='sync':os._exit(73)
+    return result
+def finish(fence,*a,**kw):
+    result=real_finish(fence,*a,**kw)
+    if stage=='finish':os._exit(74)
+    return result
+with mock.patch.object(Fence,'prepare',prepare),mock.patch.object(os,'unlink',unlink),mock.patch.object(executor_platform,'sync_directory',sync),mock.patch.object(Fence,'finish',finish):
+    executor.collect(owner,job['plan'],execute=True,operation_id='crash-op',approval_id=job['grant']['approval_id'])
+os._exit(99)
+"""
+        for index, stage in enumerate(("prepare", "unlink", "sync", "finish"), 71):
+            with self.subTest(stage=stage):
+                owner = ManagedAuthority.create(str(self.base / ("crash-" + stage)))
+                credentials = owner.register("task", "producer")
+                owner.producer_call(credentials, "start", {})
+                ident = owner.producer_call(credentials, "write", {"data": "Y3Jhc2ggZml4dHVyZQ==", "artifact_class": "temp", "disposable": True})
+                owner.producer_call(credentials, "terminal", {"status": "completed"})
+                time.sleep(1.05)
+                plan = executor.create_plan(owner, "task")
+                grant = executor.approve_plan(owner, plan, "crash-op")
+                job = self.base / (stage + ".json")
+                job.write_text(json.dumps({"stage": stage, "store": owner.path, "key": owner.owner_key, "plan": plan, "grant": grant}))
+                job.chmod(0o600)
+                child = subprocess.run([sys.executable, "-B", "-c", script, str(job)], timeout=8, capture_output=True)
+                self.assertEqual(child.returncode, index, child.stderr)
+                reopened = ManagedAuthority(owner.path, owner_key=owner.owner_key)
+                if stage == "finish":
+                    self.assertEqual(reopened.receipt("crash-op", ident)["outcome"], "unlinked")
+                    replay = executor.collect(reopened, plan, execute=True, operation_id="crash-op", approval_id=grant["approval_id"])
+                    self.assertEqual(replay["status"], "IDEMPOTENT_REPLAY")
+                    self.assertEqual(replay["removed"], {"count": 0, "bytes": 0})
+                else:
+                    self.assertTrue(reopened.snapshot("task")["recovery_required"])
+                    with self.assertRaises(AuthorityError):
+                        reopened.resume("task")
+                    with self.assertRaises(AuthorityError):
+                        executor.collect(reopened, plan, execute=True, operation_id="crash-op", approval_id=grant["approval_id"])
+                    receipt = reopened.reconcile("crash-op", ident)
+                    self.assertEqual(receipt["outcome"], "reconciled_present" if stage == "prepare" else "reconciled_missing")
+                    self.assertIsNone(receipt["removed_bytes"])
+                    self.assertEqual(receipt["causality"], "unknown")
+        self.assertEqual(self.outside.read_bytes(), b"original external fixture")
+
+    def test_deadline_after_prepare_prevents_unlink_but_allows_durable_unknown_finish(self):
+        plan, grant = self.approved()
+        original = Fence.prepare
+        def delayed(fence, *a, **kw):
+            value = original(fence, *a, **kw)
+            time.sleep(.3)
+            return value
+        with mock.patch.object(Fence, "prepare", delayed), mock.patch.object(os, "unlink", side_effect=AssertionError("effect after deadline")):
+            result = self.execute(plan, grant, deadline_seconds=.2)
+        self.assertEqual(result["status"], "RECOVERY_REQUIRED")
+        self.assertEqual(result["removed"], {"count": 0, "bytes": 0})
+        ident = result["pending_artifact_ids"][0]
+        self.assertEqual(self.authority.receipt("fixture-collection", ident)["outcome"], "unknown")
+        self.assertEqual(self.authority.reconcile("fixture-collection", ident)["outcome"], "reconciled_present")
+
+    def test_partial_batch_counts_only_durable_first_receipt(self):
+        plan, grant = self.approved()
+        original = os.unlink
+        calls = []
+        def partial(*a, **kw):
+            calls.append(a[0])
+            if len(calls) == 2:
+                raise PermissionError("injected fixture unlink refusal")
+            return original(*a, **kw)
+        with mock.patch.object(os, "unlink", partial):
+            result = self.execute(plan, grant)
+        first = plan["decisions"]
+        expected = next(row["apparent_bytes"] for row in first if row["artifact_id"] == plan["candidate"]["artifact_ids"][0])
+        self.assertEqual(result["removed"], {"count": 1, "bytes": expected})
+        self.assertEqual(result["status"], "RECOVERY_REQUIRED")
+        self.assertEqual(len(result["receipts"]), 1)
+        self.assertEqual(self.authority.reconcile("fixture-collection", result["pending_artifact_ids"][0])["outcome"], "reconciled_present")
+        self.assertEqual(self.other.read(self.other_id), b"other task canary")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""``aps`` command-line interface (phase 1: observe-only, never deletes).
+"""``aps`` CLI: legacy read-only reports and explicit closed-store collection.
 
 Exit codes: 0 success, 1 validation/refusal, 2 usage error.
 """
@@ -156,8 +156,8 @@ def _cmd_task_end(args):
 def build_parser():
     parser = _Parser(
         prog="aps",
-        description="Agent Pooper Scooper (phase 1): task manifests and observe-only Scoop "
-                    "Reports. This tool never deletes anything.")
+        description="Agent Pooper Scooper: read-only reports and explicit owner-approved "
+                    "collection inside newly created managed stores.")
     parser.add_argument("--version", action="version", version=f"aps {__version__}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
@@ -230,6 +230,8 @@ def build_parser():
     task_end.add_argument("--format", choices=("json", "markdown"), default="json")
     task_end.add_argument("--output")
     task_end.set_defaults(func=_cmd_task_end)
+    from . import managed_cli
+    managed_cli.add_commands(commands)
     return parser
 
 

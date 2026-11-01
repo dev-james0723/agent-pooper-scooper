@@ -3,6 +3,7 @@ import json
 import hashlib
 from datetime import datetime, timedelta, timezone
 import os
+import signal
 from pathlib import Path
 import stat
 import subprocess
@@ -136,6 +137,113 @@ class InstalledCliSmoke(unittest.TestCase):
             self.assertTrue(all("root_scope_too_broad" in item["reasons"] for item in refused["decisions"]))
             self.assertEqual(refused["execution"]["status"], "BLOCKED")
             self.assertEqual(protected_child.read_bytes(), b"retained history")
+
+
+    def test_installed_managed_producer_and_collection(self):
+        # Short physical fixture path also fits Darwin Unix-socket limits.
+        with tempfile.TemporaryDirectory(prefix="aps-wheel-", dir="/private/tmp" if os.path.isdir("/private/tmp") else None) as tmp:
+            base = Path(tmp).resolve()
+            store, key, creds, socket_path = (base / name for name in ("store", "owner.json", "producer.json", "broker.sock"))
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            def run(*args, expected=0):
+                result = subprocess.run([APS, *map(str, args)], cwd=base, env=environment,
+                                        capture_output=True, text=True, timeout=12)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                if "--public" in args:
+                    self.assertNotIn(str(base), result.stdout + result.stderr)
+                return json.loads(result.stdout) if result.stdout else None
+            run("managed", "init", store, "--owner-key-output", key)
+            owner_secret = json.loads(key.read_text())["owner_key"]
+            broker = subprocess.Popen([APS, "managed", "serve", str(store), "--owner-key-file", str(key),
+                                       "--socket", str(socket_path)], cwd=base, env=environment,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not socket_path.exists() and broker.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertIsNone(broker.poll(), "installed broker exited before readiness")
+                self.assertTrue(socket_path.exists())
+                prefix = ("managed", "producer", "--socket", socket_path)
+                run(*prefix, "register", "--owner-key-file", key, "--task-id", "wheel-task", "--producer-id", "fixture",
+                    "--credentials-output", creds, "--request-id", "register-wheel")
+                token = json.loads(creds.read_text())["credentials"]["token"]
+                prefix += ("--credentials-file", creds)
+                run(*prefix, "start", "--request-id", "start-wheel")
+                payload, protected = base / "synthetic.bin", base / "retained.bin"
+                payload.write_bytes(b"wheel-only generated fixture")
+                protected.write_bytes(b"protected original fixture")
+                ident = run(*prefix, "write", "--input", payload, "--disposable", "--request-id", "write-wheel")["artifact_id"]
+                keep = run(*prefix, "write", "--input", protected, "--class", "session-history", "--request-id", "write-protected")["artifact_id"]
+                claim = run(*prefix, "lease", "--artifact-id", ident, "--expires-at", "2000-01-01T00:00:00Z", "--request-id", "claim-wheel")["claim_id"]
+                owner = ("managed",)
+                owner_args = lambda command: ("managed", command, store, "--owner-key-file", key)
+                active = run(*owner_args("plan"), "--task-id", "wheel-task", "--public")
+                self.assertEqual(active["candidate"]["count"], 0)
+                run(*prefix, "terminal", "--request-id", "terminal-wheel")
+                time.sleep(1.05)
+                held = run(*owner_args("plan"), "--task-id", "wheel-task", "--public")
+                self.assertEqual(held["candidate"]["count"], 0)
+                self.assertTrue(any("lease_present" in decision["reasons"] for decision in held["decisions"]))
+                # Terminal does not clear an expired lease. A fresh owner-resumed
+                # producer explicitly releases its holder's previous generation.
+                resumed = base / "resumed.json"
+                run(*prefix, "resume", "--owner-key-file", key, "--credentials-output", resumed, "--request-id", "resume-wheel")
+                old_read = run(*prefix, "read", "--artifact-id", keep, "--output", base / "old-read", expected=1)
+                prefix = ("managed", "producer", "--socket", socket_path, "--credentials-file", resumed)
+                run(*prefix, "release", "--claim-id", claim, "--request-id", "release-wheel")
+                run(*prefix, "terminal", "--request-id", "terminal-wheel-2")
+                time.sleep(1.05)
+                plan_path, grant_path = base / "plan.json", base / "grant.json"
+                run(*owner_args("plan"), "--task-id", "wheel-task", "--output", plan_path)
+                plan = json.loads(plan_path.read_text())
+                self.assertEqual(plan["candidate"]["artifact_ids"], [ident])
+                self.assertEqual(run(*owner_args("collect"), "--plan", plan_path)["status"], "DRY_RUN")
+                run(*owner_args("approve"), "--plan", plan_path, "--operation-id", "wheel-collect", "--output", grant_path)
+                grant = json.loads(grant_path.read_text())
+                output = base / "existing-report"
+                output.write_bytes(b"preserve report")
+                run(*owner_args("collect"), "--plan", plan_path, "--operation-id", "wheel-collect", "--approval-id", grant["approval_id"],
+                    "--execute", "--output", output, "--public", expected=1)
+                self.assertEqual(output.read_bytes(), b"preserve report")
+                result = run(*owner_args("collect"), "--plan", plan_path, "--operation-id", "wheel-collect", "--approval-id", grant["approval_id"], "--execute", "--public")
+                self.assertEqual(result["removed"], {"count": 1, "bytes": len(payload.read_bytes())})
+                self.assertIsNone(result["reclaimed"]["bytes"])
+                replay = run(*owner_args("collect"), "--plan", plan_path, "--operation-id", "wheel-collect", "--approval-id", grant["approval_id"], "--execute")
+                self.assertEqual(replay["status"], "IDEMPOTENT_REPLAY")
+                self.assertEqual(replay["removed"]["bytes"], 0)
+                for private in (owner_secret, token, str(base)):
+                    self.assertNotIn(private, json.dumps(result))
+                self.assertEqual(payload.read_bytes(), b"wheel-only generated fixture")
+                self.assertEqual(protected.read_bytes(), b"protected original fixture")
+                self.assertTrue((store / "control/lock").exists())
+                self.assertTrue((store / "control/registry.sqlite3").exists())
+                # Fresh installed API reads the durable registry through its
+                # owner capability, never by editing raw database state.
+                probe = ("import json,sys;from agent_pooper_scooper.authority import ManagedAuthority;"
+                         "key=json.load(open(sys.argv[2]))['owner_key'];a=ManagedAuthority(sys.argv[1],owner_key=key);"
+                         "s=a.snapshot('wheel-task');items={x['artifact_id']:x for x in s['inventory']};"
+                         "assert a.receipt('wheel-collect',sys.argv[3])['outcome']=='unlinked';"
+                         "from pathlib import Path;root=Path(s['root']['path']);"
+                         "assert not (root/items[sys.argv[3]]['name']).exists();"
+                         "assert (root/items[sys.argv[4]]['name']).read_bytes()==b'protected original fixture';"
+                         "print('durable installed receipt and protected bytes verified')")
+                check = subprocess.run([sys.executable, "-I", "-B", "-c", probe, str(store), str(key), ident, keep],
+                                       cwd=base, env=environment, text=True, capture_output=True, timeout=8)
+                self.assertEqual(check.returncode, 0, check.stderr)
+            finally:
+                if broker.poll() is None:
+                    broker.send_signal(signal.SIGINT)
+                try:
+                    stdout, stderr = broker.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    broker.kill()
+                    broker.communicate()
+                    self.fail("own installed broker did not stop within lifecycle deadline")
+                self.assertNotIn(owner_secret, stdout + stderr)
+                self.assertNotIn("Traceback", stderr)
+                self.assertEqual(broker.returncode, 0, stderr)
 
     def test_installed_observe_only_workflow(self):
         self.assertIsNotNone(APS, "pass the installed aps executable")

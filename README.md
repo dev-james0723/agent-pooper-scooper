@@ -6,7 +6,7 @@
 
 Agent Pooper Scooper is an open-source project for **task-aware, safety-first disk cleanup and friendly Scoop Reports**. The goal: reclaim disposable scratch space without destroying work that AI coding agents, other tasks, or future resumed sessions might still need.
 
-> **Project status: pre-alpha / read-only planning.** The package provides task manifests, strict event validation, on-demand telemetry, JSON/Markdown Scoop Reports, and a conservative regular-file planner with null/file adapter seams. **There is no cleanup executor or automatic cleaner.** Execution is blocked; background watching and live provider/notification integrations remain unavailable.
+> **Project status: pre-alpha / managed executor development.** Legacy manifests, telemetry, reports and file/null evidence planning remain read-only, with their execution BLOCKED. The experimental `aps managed` commands can collect explicitly approved regular files created by the APS producer broker in a new closed store. They cannot adopt existing user data or provide host-wide cleanup. Independent authority/executor/integration acceptance remains required; background cleaning and global native lifecycle authority are unavailable.
 
 ## Why?
 
@@ -23,7 +23,7 @@ Coding agents can generate gigabytes of build outputs, test caches, temporary fi
 - **Provider-neutral events** — versioned strict schemas and JSON Lines validation. Automatic integrations remain future work.
 - **Future capabilities** — disk pressure alerts, task-end automation, reference/lease protection, independently reviewed cleanup policy, and notification adapters.
 
-Safe cleanup remains planned. A disposable flag or terminal event never grants deletion authority.
+A disposable flag or terminal event never grants deletion authority. See [managed execution safety](docs/EXECUTION_SAFETY.md) for the separate closed-store owner approval, producer fence, recovery protocol and unsupported containment assumptions. No existing manifest or native snapshot can authorize that executor.
 
 ## Install and try Phase 1
 
