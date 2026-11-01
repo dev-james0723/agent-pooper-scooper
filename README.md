@@ -17,11 +17,12 @@ Coding agents can generate gigabytes of build outputs, test caches, temporary fi
 ## Features and roadmap
 
 - **Manifest-based attribution** — record artifacts with task, host, producer, class, explicit disposable flag, timestamps, and device/inode identity. Unrecorded writes are not attributed.
-- **Safe cleanup** — auto-remove only explicitly disposable, task-owned scratch files after checked leases, reference checks and a retention grace period.
-- **Scoop Reports** — manually generate measured, retained, dry-run candidate, unknown, and skipped accounting. Removed and reclaimed-by-this-tool bytes are always zero in Phase 1.
+- **Managed collection** — explicitly approve a fresh plan for broker-created disposable regular files, with terminal/grace checks, unreleased-reference/lease protection, durable intent and receipt accounting. Dry-run is the default; existing directories cannot be adopted.
+- **Scoop Reports** — legacy reports distinguish measured, retained, candidate, unknown and skipped accounting with zero removal. Managed collection separately reports durable verified unlink bytes and replay/recovery outcomes; reclaimed capacity remains unknown.
 - **Read-only telemetry** — volume capacity via `statvfs`, bounded registered-root walks, hardlink deduplication, symlink refusal, mount-boundary skips, and explicit unknowns.
 - **Provider-neutral events** — versioned strict schemas and JSON Lines validation. Automatic integrations remain future work.
-- **Future capabilities** — disk pressure alerts, task-end automation, reference/lease protection, independently reviewed cleanup policy, and notification adapters.
+- **Managed producer lifecycle** — opaque object IDs and bytes, explicit reference/lease release, revoked generation tokens on terminal state, and owner-controlled resume. Every participating operation uses the same broker fence.
+- **Future capabilities** — background pressure alerts, broader task-end automation and optional independently verified provider transports. Native-global reference/resume authority is unavailable.
 
 A disposable flag or terminal event never grants deletion authority. See [managed execution safety](docs/EXECUTION_SAFETY.md) for the separate closed-store owner approval, producer fence, recovery protocol and unsupported containment assumptions. No existing manifest or native snapshot can authorize that executor.
 
@@ -73,9 +74,9 @@ A real report must distinguish file sizes from actual reclaimed SSD capacity (wh
 ## Safety contract
 
 1. **Observe-only by default.** Unknown owner, file identity, task state, or lease means **keep**.
-2. Automatic deletion is limited to deliberately registered, task-owned disposable scratch roots, with strict policy checks.
+2. Executable collection is limited to files created by the APS broker in a new closed store, with a reviewed plan and explicit owner approval. Existing registered roots remain read-only.
 3. Never automatically delete uncommitted code, worktrees, drafts, session histories, local models, original media, user downloads, credentials or unknown files.
-4. Recheck permissions and file identity immediately before changes; defend against symlink traversal and filesystem races.
+4. Recheck permissions, no-follow identity, deadlines and mount exclusions inside the shared producer fence. Raw same-UID writers and external namespace/mount actors are outside the managed contract; metadata checks are not atomic containment.
 5. Task-completed events trigger **evaluation**, never blanket deletion.
 6. Report skipped files and uncertainties; never invent storage savings.
 
