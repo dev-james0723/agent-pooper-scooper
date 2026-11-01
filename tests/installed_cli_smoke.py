@@ -223,6 +223,8 @@ class InstalledCliSmoke(unittest.TestCase):
                 report_bridge = base / "report-bridge.py"
                 report_bridge.write_text("import json,sys\nrequest=json.load(sys.stdin)\n"
                                          "assert request['tool']=='notify'\n"
+                                         "assert 'cumulative confirmed removal history:' in request['arguments']['message']\n"
+                                         "assert 'Historical confirmed lower bound; no new removals by this report.' in request['arguments']['message']\n"
                                          "assert 'Reclaimed capacity unknown.' in request['arguments']['message']\n"
                                          "print(json.dumps({'content':[{'type':'text','text':'Notification sent.'}]}))\n")
                 delivered = run("integrations", "notice", store, "--owner-key-file", key,

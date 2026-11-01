@@ -54,7 +54,9 @@ class ManagedReportTests(unittest.TestCase):
         # Existing product notifier projection accepts the WHOLE unified report.
         projection, message = live_adapters._notice(report, True)
         self.assertEqual(projection["removed_bytes"], 17)
-        self.assertIn("17 logical bytes", message)
+        self.assertEqual(message, "TEST: synthetic fixture only. Scoop Report: cumulative confirmed removal history: "
+                         "1 files / 17 known logical bytes. Historical confirmed lower bound; no new removals by this report. "
+                         "Reclaimed capacity unknown.")
 
     def test_repeated_report_is_read_only_and_does_not_count_new_removals(self):
         self.collect()
