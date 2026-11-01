@@ -1,106 +1,224 @@
 #!/usr/bin/env python3
-"""Open a draft PR for a reviewed branch of this PUBLIC repo.
+"""Validate a reviewed commit, then explicitly update or create a draft PR.
 
-Defaults to no network writes. --publish must be explicit, and it must be
-invoked by a trusted publisher after independent review. A pattern scan
-is not proof that sensitive content was not overlooked.
+Dry-run is local only. Publication requires an exact independently reviewed
+SHA and an explicit target branch. Existing-PR mode never creates a PR.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
-from publication_gate import scan_repository
+from publication_gate import (DEFAULT_BASE, git_env, list_tree, read_blobs,
+                              scan_publication)
 
 EXPECTED_REMOTE = "dev-james0723/agent-pooper-scooper"
+PUSH_URL = f"https://github.com/{EXPECTED_REMOTE}.git"
+APPROVED_URLS = {PUSH_URL, PUSH_URL.removesuffix(".git"),
+                 f"git@github.com:{EXPECTED_REMOTE}.git"}
 BRANCH_PATTERN = re.compile(r"^(?:ao|chore|feat|fix|docs)/[a-z0-9][a-z0-9._/-]*$")
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+PR_FIELDS = ("number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+             "isCrossRepository,headRepositoryOwner,headRepository")
 
 
 def run(args: list[str], root: Path) -> str:
-    result = subprocess.run(
-        args, cwd=root, capture_output=True, text=True, check=True
-    )
-    return result.stdout.strip()
+    env = git_env()
+    # gh always uses github.com and the explicit --repo, irrespective of ambient overrides.
+    env.pop("GH_REPO", None)
+    env.pop("GH_HOST", None)
+    return subprocess.run(args, cwd=root, capture_output=True, text=True,
+                          check=True, env=env).stdout.strip()
 
 
-def verify_repo(root: Path) -> tuple[str, list[str]]:
+@dataclass(frozen=True)
+class LocalState:
+    branch: str
+    sha: str
+    config_digest: str
+
+
+def verify_repo(root: Path, expected_sha: str | None) -> LocalState:
+    if os.environ.get("GH_REPO"):
+        raise ValueError("GH_REPO override is not permitted")
+    if os.environ.get("GH_HOST", "github.com") != "github.com":
+        raise ValueError("GH_HOST override is not permitted")
     toplevel = Path(run(["git", "rev-parse", "--show-toplevel"], root)).resolve()
-    if toplevel != root.resolve():
+    if toplevel != root:
         raise ValueError("Use the root directory of this repository/worktree")
-    remote = run(["git", "remote", "get-url", "origin"], root)
-    if remote not in (
-        f"https://github.com/{EXPECTED_REMOTE}.git",
-        f"https://github.com/{EXPECTED_REMOTE}",
-        f"git@github.com:{EXPECTED_REMOTE}.git",
-    ):
-        raise ValueError("Origin remote is not the approved public repository")
+    for flags, label in (([], "fetch URL"), (["--push"], "push URL")):
+        urls = run(["git", "remote", "get-url", *flags, "--all", "origin"], root).splitlines()
+        if not urls or any(url not in APPROVED_URLS for url in urls):
+            raise ValueError(f"Origin {label} is not the approved public repository")
+    config = run(["git", "config", "--null", "--list", "--includes"], root)
+    if any(re.match(r"url\..*\.(?:insteadof|pushinsteadof)\n", item.lower())
+           for item in config.split("\0")):
+        raise ValueError("URL rewrites are not permitted for publication")
     branch = run(["git", "branch", "--show-current"], root)
     if not BRANCH_PATTERN.fullmatch(branch):
         raise ValueError("Use a feature branch, never main or detached HEAD")
-    if run(["git", "status", "--porcelain"], root):
+    sha = run(["git", "rev-parse", "HEAD"], root)
+    if expected_sha is not None and (not SHA_PATTERN.fullmatch(expected_sha) or sha != expected_sha):
+        raise ValueError("HEAD changed or does not equal the exact reviewed SHA")
+    if run(["git", "status", "--porcelain", "--untracked-files=all"], root):
         raise ValueError("Working tree is dirty; commit and review exact changes first")
-    problems = scan_repository(root)
-    if problems:
-        raise ValueError("Publication gate failed:\n" + "\n".join(problems))
-    filenames = run(
-        ["git", "diff", "--name-only", "--diff-filter=ACMR", "origin/main...HEAD"],
-        root,
-    ).splitlines()
-    if not filenames:
-        raise ValueError("No commits different from origin/main")
-    return branch, filenames
+    return LocalState(branch, sha, hashlib.sha256(config.encode()).hexdigest())
+
+
+def remote_heads(root: Path, branch: str) -> dict[str, str]:
+    out = run(["git", "ls-remote", "--heads", PUSH_URL,
+               "refs/heads/main", f"refs/heads/{branch}"], root)
+    result = {}
+    for line in out.splitlines():
+        oid, ref = line.split("\t")
+        if not SHA_PATTERN.fullmatch(oid) or ref in result:
+            raise ValueError("Unexpected remote ref response")
+        result[ref] = oid
+    return result
+
+
+def gh(root: Path, *args: str) -> str:
+    return run(["gh", "pr", *args, "--repo", EXPECTED_REMOTE], root)
+
+
+def verify_pr(root: Path, number: str, branch: str, head: str) -> dict:
+    pr = json.loads(gh(root, "view", number, "--json", PR_FIELDS))
+    expected_url = f"https://github.com/{EXPECTED_REMOTE}/pull/{pr.get('number')}"
+    if (pr.get("url") != expected_url or str(pr.get("number")) != number
+            or pr.get("isCrossRepository") is not False
+            or pr.get("headRepositoryOwner", {}).get("login", "").lower() != EXPECTED_REMOTE.split("/")[0]
+            or pr.get("headRepository", {}).get("name") != EXPECTED_REMOTE.split("/")[1]):
+        raise ValueError("PR repository/head identity is not the approved repository")
+    if pr.get("state") != "OPEN":
+        raise ValueError("Existing PR must be OPEN")
+    if pr.get("isDraft") is not True:
+        raise ValueError("Existing PR must remain a draft")
+    if pr.get("headRefName") != branch or pr.get("baseRefName") != "main":
+        raise ValueError("PR branch/base does not match the explicit target branch/main")
+    if pr.get("headRefOid") != head:
+        raise ValueError("PR head does not match the expected remote branch head")
+    return pr
+
+
+def preflight_remote(root: Path, branch: str, sha: str, number: str | None) -> dict[str, str]:
+    default = run(["git", "ls-remote", "--symref", PUSH_URL, "HEAD"], root)
+    if "ref: refs/heads/main\tHEAD" not in default.splitlines() or branch == "main":
+        raise ValueError("Refusing unexpected remote default branch or default branch target")
+    heads = remote_heads(root, branch)
+    baseline = run(["git", "rev-parse", "--verify", DEFAULT_BASE], root)
+    if heads.get("refs/heads/main") != baseline:
+        raise ValueError("Remote main differs from local baseline; fetch and review again")
+    old = heads.get(f"refs/heads/{branch}")
+    if old:
+        try:
+            run(["git", "merge-base", "--is-ancestor", old, sha], root)
+        except subprocess.CalledProcessError:
+            raise ValueError("Target head cannot fast-forward to reviewed SHA") from None
+    if number:
+        if not old:
+            raise ValueError("Existing PR target branch head is missing")
+        verify_pr(root, number, branch, old)
+    else:
+        prs = json.loads(gh(root, "list", "--state", "all", "--head", branch,
+                            "--json", PR_FIELDS))
+        if not isinstance(prs, list) or prs:
+            raise ValueError("Create-draft mode requires no existing PR for the target branch")
+    return heads
+
+
+def check_gate(root: Path, sha: str) -> None:
+    result = scan_publication(root, sha)
+    if result.problems:
+        raise ValueError("Publication gate failed:\n" + "\n".join(result.problems))
+    print(f"Object gate PASS: {result.files} files, {result.commits} new commit(s), {sha}")
+
+
+def run_snapshot_tests(root: Path, sha: str) -> None:
+    # Run the reviewed bytes even if index flags hide different working files.
+    entries = [entry for entry in list_tree(root, sha) if entry[1] == "blob"]
+    blobs = read_blobs(root, sorted({entry[2] for entry in entries}))
+    with tempfile.TemporaryDirectory(prefix="aps-reviewed-tests-") as directory:
+        snapshot = Path(directory)
+        for mode, _, oid, _, raw_path in entries:
+            target = snapshot / raw_path.decode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blobs[oid])
+            target.chmod(int(mode, 8) & 0o777)
+        run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], snapshot)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--publish", action="store_true", help="Push branch and create draft PR")
-    parser.add_argument("--title", required=True, help="PR title")
+    parser.add_argument("--publish", action="store_true")
     parser.add_argument("--repo", type=Path, default=Path("."))
+    parser.add_argument("--expected-sha", help="exact independently reviewed 40-character SHA")
+    parser.add_argument("--target-branch", help="explicit destination branch")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--pr", type=int, help="update this existing OPEN DRAFT PR only")
+    mode.add_argument("--create-draft", action="store_true", help="explicitly create a new draft")
+    parser.add_argument("--title", help="title for explicit create-draft mode")
     args = parser.parse_args()
     root = args.repo.resolve()
-    if not args.title.strip() or len(args.title) > 180:
-        parser.error("PR title must be between 1 and 180 characters")
+    push_attempted = False
     try:
-        branch, filenames = verify_repo(root)
-        run(
-            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
-            root,
-        )
-        sha = run(["git", "rev-parse", "HEAD"], root)
-        print("Local publication checks PASS")
-        print("Source branch:", branch, "at", sha)
-        print("File count:", len(filenames))
-        print("Changed files:", ", ".join(filenames))
+        if args.publish and (not args.expected_sha or not args.target_branch
+                             or not (args.pr or args.create_draft)):
+            raise ValueError("Publish requires --expected-sha, --target-branch and --pr or --create-draft")
+        if args.pr is not None and args.pr <= 0:
+            raise ValueError("PR number must be positive")
+        if args.create_draft and (not args.title or not args.title.strip() or len(args.title) > 180):
+            raise ValueError("Create-draft requires a title between 1 and 180 characters")
+        before = verify_repo(root, args.expected_sha)
+        branch = args.target_branch or before.branch
+        if (not BRANCH_PATTERN.fullmatch(branch)
+                or run(["git", "check-ref-format", f"refs/heads/{branch}"], root)):
+            raise ValueError("Invalid target feature branch")
+        check_gate(root, before.sha)
+        number = str(args.pr) if args.pr else None
+        remote_before = preflight_remote(root, branch, before.sha, number) if args.publish else None
+        run_snapshot_tests(root, before.sha)
+        after = verify_repo(root, before.sha)
+        if after != before:
+            raise ValueError("Branch or Git configuration changed during tests")
+        if args.publish and preflight_remote(root, branch, before.sha, number) != remote_before:
+            raise ValueError("Remote refs changed during tests; review again")
+        print("Local publication checks PASS:", before.sha)
         if not args.publish:
-            print("DRY RUN only: no push, no PR, no merge")
+            print("DRY RUN only: no network, push or PR changes")
             return 0
-        print("Publishing reviewed changes as a DRAFT PR (not merging).")
-        run(["git", "push", "--set-upstream", "origin", branch], root)
-        try:
-            url = run(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"], root)
-        except subprocess.CalledProcessError:
-            body = (
-                "## Scope\nAgent Pooper Scooper public repository files only.\n\n"
-                "## Prepublication checks\n"
-                "- [x] Approved origin and non-main branch\n"
-                "- [x] Public path allowlist, token patterns, symlink and size checks\n"
-                "- [x] Local standard-library unit tests\n"
-                "- [ ] Independent code, security, privacy and license review before merge\n"
-                "- [ ] GitHub CI green\n\n"
-                "Draft PR only; no automatic merge or deployment.\n"
-            )
-            url = run(
-                ["gh", "pr", "create", "--draft", "--base", "main",
-                 "--head", branch, "--title", args.title, "--body", body],
-                root,
-            )
-        print("Draft pull request:", url)
+        # Explicit URL, exact source object, one destination ref, no forced update,
+        # implicit tags, submodules or pre-push hooks. Never pushes a branch name.
+        push_attempted = True
+        run(["git", "push", "--porcelain", "--no-force", "--no-verify", "--no-follow-tags",
+             "--recurse-submodules=no", "--", PUSH_URL,
+             f"{before.sha}:refs/heads/{branch}"], root)
+        if remote_heads(root, branch).get(f"refs/heads/{branch}") != before.sha:
+            raise ValueError("Remote head differs after push; inspect before any retry")
+        if args.create_draft:
+            url = gh(root, "create", "--draft", "--base", "main", "--head", branch,
+                     "--title", args.title, "--body",
+                     "Public product files only. Exact-SHA local checks completed. "
+                     "Independent prepublication review required; CI and human merge review remain separate.")
+            prefix = f"https://github.com/{EXPECTED_REMOTE}/pull/"
+            if not url.startswith(prefix) or not url.removeprefix(prefix).isdigit():
+                raise ValueError("Unexpected created PR URL; inspect before retrying")
+            number = url.removeprefix(prefix)
+        pr = verify_pr(root, number, branch, before.sha)
+        print("Draft pull request:", pr["url"])
+        print("Verified remote SHA:", before.sha)
         return 0
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        print("PUBLICATION REFUSED:", str(exc), file=sys.stderr)
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.CalledProcessError) as exc:
+        prefix = ("PUBLICATION INCOMPLETE (push may have occurred; inspect before retrying):"
+                  if push_attempted else "PUBLICATION REFUSED:")
+        print(prefix, str(exc), file=sys.stderr)
         return 1
 
 
