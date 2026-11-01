@@ -10,6 +10,48 @@ The owner is a genuine `ManagedAuthority`; its broker must already be serving.
 Opening an existing journal uses `ManagedTaskCoordinator(...)`, never `create`.
 No new daemon, arbitrary command runner, dependency or stdin transport is added.
 
+## Explicit CLI setup and continuation
+
+The CLI has a separate journal initialization command. All other lifecycle
+commands open an existing validated journal; failed open never becomes create.
+The existing owner broker remains the foreground `aps managed serve` process.
+
+```sh
+aps managed lifecycle init /physical/store --owner-key-file /physical/owner.json \
+  --socket /physical/rpc.sock --journal /physical/new-workflow
+aps managed lifecycle enroll /physical/store --owner-key-file /physical/owner.json \
+  --socket /physical/rpc.sock --journal /physical/new-workflow \
+  --task-id example --producer-id cooperating-client --request-id enroll-example \
+  --credentials-output /physical/new-producer.json
+aps managed lifecycle status /physical/store --owner-key-file /physical/owner.json \
+  --socket /physical/rpc.sock --journal /physical/new-workflow --public
+```
+
+These setup commands do not run arbitrary programs or enroll native sessions.
+The trusted host runs its actual cooperating callable through `run_producer`.
+Normal completion automatically creates the report; the owner can then inspect
+that same immutable preview using `lifecycle task-end --task-id ...
+--request-id ...`. A new `--output` selects a private report file. Credential
+and report outputs must be outside **both** the managed store and workflow
+journal. The wrapper authenticates owner/journal first, applies the reviewed
+physical ancestry guard only as a DENY check, and reserves exclusive 0600
+outputs before enrollment, resume, collection or delivery.
+
+Later approved collection uses the existing `managed plan` and `managed approve`
+commands. Pass the exact unredacted plan, approval ID and operation ID to
+`lifecycle task-end --execute`. Default evaluation does not refresh grants.
+An optional `--send` additionally requires the explicit device/mission and a
+configured `--bridge-command-json` or private `--stdio` callback. Configuration
+alone never constructs a transport or sends. `--stdio --public` refuses before
+protocol construction. Output errors/refusals are generic; inspect the durable
+journal and owner receipts after an uncertain effect instead of changing keys.
+
+`lifecycle resume` requires owner authentication and a newly selected private
+credential-output file; it never prints producer credentials. There is no CLI
+shell/module runner: producer work remains an explicitly cooperating SDK call.
+The CLI is covered by focused fixture tests; fresh installed acceptance is a
+separate gate, not inferred from those tests or this usage example.
+
 ## Primary producer flow
 
 The trusted launcher calls `enroll(task_id, producer_id, request_id)` and gives
@@ -115,8 +157,8 @@ component provides no new live notification proof or permission.
 
 ## Remaining delivery and external gaps
 
-This first SDK component precedes CLI and installed-flow wiring. It can
-orchestrate an explicitly cooperating producer, not ordinary native processes
+The SDK and explicit CLI can orchestrate an explicitly cooperating producer,
+not ordinary native processes
 using arbitrary paths or TMPDIR. Real AO/Kynlo producer hooks must enroll at
 artifact creation and mediate every access/reference/resume. Checked native
 observation, bounded-command and notification contracts do not establish that

@@ -57,6 +57,39 @@ aps task-end task.json --events events.jsonl --evidence snapshot.json --public
 
 File evidence is an unauthenticated operator assertion, bound to the manifest digest and a short freshness window. The planner checks explicit root approvals, identity, terminal state, grace, complete reference/lease claims, Git/worktree and mount exclusions. Unknown means KEEP. Candidates are regular files only; even a `WOULD_REMOVE` result has execution **BLOCKED**. `--execute` returns exit 1 without performing cleanup. See [planner boundaries and research](docs/PHASE2.md).
 
+## Cooperating producer lifecycle (opt-in)
+
+The lifecycle SDK can start an explicitly enrolled cooperating producer and
+automatically record its authenticated normal completion and qualified report:
+
+```python
+# The trusted host supplies an authenticated owner, serving broker and private journal.
+from agent_pooper_scooper.managed_lifecycle import ManagedTaskCoordinator
+
+coordinator = ManagedTaskCoordinator(owner, broker.socket_path, journal_path)
+client = coordinator.enroll("example", "cooperating-client", "enroll-example")
+
+def task(producer):
+    generated_result = bytes(range(17))  # Illustrative primary task bytes, not an imported file.
+    producer.write(generated_result, disposable=True)
+
+result = coordinator.run_producer(client, task, "run-example")
+```
+
+`aps managed lifecycle init` explicitly creates a new private journal;
+`enroll`, `resume`, `task-end` and `status` only open a validated existing one.
+Credential/report files are exclusive 0600 outputs outside the store and journal.
+Default task-end processing evaluates and reports; later collection requires
+an exact fresh owner grant and explicit `--execute`. Delivery additionally
+requires `--send` and a configured private callback. Replays cannot re-run the
+producer or create another delivery slot; unknown stages stop for inspection.
+
+This is a cooperative protocol, not a Python sandbox or automatic native
+AO/Kynlo enrollment. Producer artifacts must be broker-owned from creation;
+copying an unmanaged input does not reclaim its original. Existing user/native
+data stays outside execution. See [lifecycle setup, bounds and remaining
+acceptance gates](docs/MANAGED_LIFECYCLE.md). No background service is installed.
+
 ## Unified managed task reports
 
 After a producer records terminal state and the owner evaluates or collects its managed files:

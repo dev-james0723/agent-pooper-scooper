@@ -271,3 +271,5 @@ def add_commands(commands):
         if name in ("set-state", "terminal"):
             action.add_argument("--status", choices=("paused", "resumable") if name == "set-state" else ("completed", "failed"),
                                 required=name == "set-state", default=None if name == "set-state" else "completed")
+    from . import lifecycle_cli
+    lifecycle_cli.add_commands(sub)
