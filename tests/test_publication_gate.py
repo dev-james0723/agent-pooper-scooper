@@ -7,6 +7,7 @@ fragments so this file never contains a literal match for the gate's own
 patterns.
 """
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.publication_gate import git_env, resolve_commit, safe_relative_path, scan_publication
+from tools.publication_gate import (MAX_FILE_BYTES, git_env, read_blobs, resolve_commit,
+                                    safe_relative_path, scan_publication)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE_CLI = REPO_ROOT / "tools" / "publication_gate.py"
@@ -276,6 +278,30 @@ class ObjectScanTests(GateTestCase):
         # no remote or promisor configured, so no command can retrieve it.
         (self.repo.path / ".git/objects" / oid[:2] / oid[2:]).unlink()
         self.assertGateFails("fail closed")
+
+    def test_large_blob_batch_completes_without_pipe_deadlock(self):
+        for index in range(64):
+            self.repo.write(f"docs/batch-{index}.md", f"fixture {index}\n" + "q" * (96 * 1024))
+        self.repo.commit("docs: batch fixtures")
+        process = subprocess.Popen(
+            [sys.executable, str(GATE_CLI), "--repo", str(self.repo.path)],
+            env=hermetic_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        try:
+            out, err = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # This process group contains only this test's gate and Git children.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            self.fail("large Git blob batch exceeded 10 seconds (pipe deadlock)")
+        self.assertEqual(process.returncode, 0, out + err)
+
+    def test_blob_reader_refuses_oversized_object(self):
+        self.repo.write("docs/oversized.md", b"q" * (MAX_FILE_BYTES + 1))
+        self.repo.commit("docs: oversized fixture")
+        oid = self.repo.git("rev-parse", "HEAD:docs/oversized.md")
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            read_blobs(self.repo.path, [oid])
 
     def test_empty_forbidden_tree_is_rejected(self):
         empty = self.repo.git("mktree", input=b"")

@@ -19,11 +19,13 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_BASE = "refs/remotes/origin/main"
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_BATCH_BLOBS = 16
 ALLOWED_MODES = {"100644", "100755"}
 MODE_NAMES = {"120000": "symlink", "160000": "gitlink/submodule", "040000": "tree"}
 ALLOWED_ROOT_FILES = {
@@ -105,10 +107,15 @@ def git_env() -> dict[str, str]:
 
 
 def git(root: Path, *args: str, input: bytes | None = None) -> bytes:
-    return subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, check=True,
-        env=git_env(), input=input,
-    ).stdout
+    kwargs = dict(cwd=root, capture_output=True, check=True, env=git_env())
+    if input is None:
+        return subprocess.run(["git", *args], **kwargs).stdout
+    # Batch responses can fill stdout while requests are still being written.
+    # A regular request file removes the bidirectional pipe/backpressure cycle.
+    with tempfile.TemporaryFile() as requests:
+        requests.write(input)
+        requests.seek(0)
+        return subprocess.run(["git", *args], stdin=requests, **kwargs).stdout
 
 
 def resolve_commit(root: Path, rev: str) -> str | None:
@@ -133,18 +140,38 @@ def list_tree(root: Path, commit: str) -> list[tuple[str, str, str, str, bytes]]
 
 
 def read_blobs(root: Path, oids: list[str]) -> dict[str, bytes]:
-    if not oids:
-        return {}
-    out = git(root, "cat-file", "--batch", input=("\n".join(oids) + "\n").encode())
-    blobs, pos = {}, 0
-    for oid in oids:
-        end = out.index(b"\n", pos)
-        header = out[pos:end].split()
-        if len(header) != 3 or header[1] != b"blob":
-            raise ValueError(f"object {oid} is missing or not a blob")
+    def blob_size(line: bytes, oid: str) -> int:
+        header = line.split()
+        if len(header) != 3 or header[0] != oid.encode() or header[1] != b"blob":
+            raise ValueError(f"object {oid} is missing or not the expected blob")
         size = int(header[2])
-        blobs[oid] = out[end + 1:end + 1 + size]
-        pos = end + 1 + size + 1
+        if size < 0 or size > MAX_FILE_BYTES:
+            raise ValueError(f"object {oid} exceeds {MAX_FILE_BYTES} bytes")
+        return size
+
+    blobs = {}
+    for start in range(0, len(oids), MAX_BATCH_BLOBS):
+        chunk = oids[start:start + MAX_BATCH_BLOBS]
+        requests = ("\n".join(chunk) + "\n").encode()
+        metadata = git(root, "cat-file", "--batch-check", input=requests).splitlines()
+        if len(metadata) != len(chunk):
+            raise ValueError("incomplete Git object metadata")
+        # Refuse oversized objects before capturing their payloads. Each response
+        # batch is at most 16 * 2 MiB plus headers for immutable Git objects.
+        sizes = [blob_size(line, oid) for line, oid in zip(metadata, chunk)]
+        out = git(root, "cat-file", "--batch", input=requests)
+        pos = 0
+        for oid, expected_size in zip(chunk, sizes):
+            end = out.index(b"\n", pos)
+            size = blob_size(out[pos:end], oid)
+            begin = end + 1
+            if (size != expected_size or len(out) <= begin + size
+                    or out[begin + size:begin + size + 1] != b"\n"):
+                raise ValueError(f"incomplete or changed object {oid}")
+            blobs[oid] = out[begin:begin + size]
+            pos = begin + size + 1
+        if pos != len(out):
+            raise ValueError("unexpected data after Git blob batch")
     return blobs
 
 
