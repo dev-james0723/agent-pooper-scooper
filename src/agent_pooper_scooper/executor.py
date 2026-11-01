@@ -400,6 +400,12 @@ def _collect(authority, plan, *, execute, approval_id, operation_id, deadline_se
                     named = _fingerprint(os.stat(item["name"], dir_fd=fence.root_fd, follow_symlinks=False))
                     if named != info:
                         raise ExecutionRefused("managed object changed after durable intent")
+                    # Metadata/SQLite observations can outlast the earlier
+                    # check. Revalidate after them and sample the clock again
+                    # after check's own I/O, immediately before dispatch.
+                    fence.check(intent)
+                    if time.monotonic() >= fence.deadline:
+                        raise ExecutionRefused("managed effect deadline expired")
                     os.unlink(item["name"], dir_fd=fence.root_fd)
                     try:
                         os.stat(item["name"], dir_fd=fence.root_fd, follow_symlinks=False)
@@ -412,6 +418,8 @@ def _collect(authority, plan, *, execute, approval_id, operation_id, deadline_se
                             info["dev"], info["ino"], info["uid"], info["size"], 0):
                         raise ExecutionRefused("unlinked object identity or link count is unverified")
                     executor_platform.sync_directory(fence.root_fd)
+                    if _digest(executor_platform.observe(fence.root_fd, native["canonical_root"])) != _digest(native):
+                        raise ExecutionRefused("managed post-unlink mount observation changed")
                     receipt = _effect_receipt(plan, operation_id, artifact_id, identity, "unlinked",
                                               namespace_absent=True,
                                               post_unlink={"dev": post.st_dev, "ino": post.st_ino, "nlink": 0})

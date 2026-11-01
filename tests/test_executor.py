@@ -413,6 +413,54 @@ os._exit(99)
         self.assertEqual(self.authority.receipt("fixture-collection", ident)["outcome"], "unknown")
         self.assertEqual(self.authority.reconcile("fixture-collection", ident)["outcome"], "reconciled_present")
 
+    def test_post_prepare_metadata_delay_cannot_start_unlink_after_deadline(self):
+        plan = executor.create_plan(self.authority, "task", artifact_ids=[self.ids[0]])
+        grant = executor.approve_plan(self.authority, plan, "fixture-collection")
+        original = os.stat
+        prepared = threading.Event()
+        deadline = []
+        real_prepare = Fence.prepare
+        def prepare(fence, *a, **kw):
+            result = real_prepare(fence, *a, **kw)
+            deadline.append(fence.deadline)
+            prepared.set()
+            return result
+        delayed = []
+        def stat_after_deadline(*a, **kw):
+            if prepared.is_set() and kw.get("dir_fd") is not None and not delayed:
+                delayed.append(True)
+                time.sleep(max(0, deadline[0] - time.monotonic()) + .03)
+            return original(*a, **kw)
+        real_unlink = os.unlink
+        effects = []
+        def unlink(*a, **kw):
+            effects.append(time.monotonic())
+            return real_unlink(*a, **kw)
+        with mock.patch.object(Fence, "prepare", prepare), mock.patch.object(os, "stat", stat_after_deadline), mock.patch.object(os, "unlink", unlink):
+            result = self.execute(plan, grant, deadline_seconds=.3)
+        self.assertTrue(delayed)
+        self.assertEqual(effects, [], "a new unlink began after the effect deadline")
+        self.assertEqual(result["status"], "RECOVERY_REQUIRED")
+        self.assertEqual(result["removed"], {"count": 0, "bytes": 0})
+        self.assertEqual(self.authority.reconcile("fixture-collection", self.ids[0])["outcome"], "reconciled_present")
+
+    def test_unknown_post_unlink_mount_observation_is_not_verified_removed(self):
+        plan = executor.create_plan(self.authority, "task", artifact_ids=[self.ids[0]])
+        grant = executor.approve_plan(self.authority, plan, "fixture-collection")
+        target = self.paths()[self.ids[0]]
+        original = executor.executor_platform.observe
+        def observe(fd, root):
+            if not target.exists():
+                raise executor.executor_platform.PlatformUnavailable("fixture topology observation changed")
+            return original(fd, root)
+        with mock.patch.object(executor.executor_platform, "observe", observe):
+            result = self.execute(plan, grant)
+        self.assertFalse(target.exists())
+        self.assertEqual(result["status"], "RECOVERY_REQUIRED")
+        self.assertEqual(result["removed"], {"count": 0, "bytes": 0})
+        self.assertIsNone(result["reclaimed"]["bytes"])
+        self.assertEqual(self.authority.reconcile("fixture-collection", self.ids[0])["outcome"], "reconciled_missing")
+
     def test_partial_batch_counts_only_durable_first_receipt(self):
         plan, grant = self.approved()
         original = os.unlink
