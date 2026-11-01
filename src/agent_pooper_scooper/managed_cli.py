@@ -162,7 +162,10 @@ def run(args):
             sys.stdout.write(_serialize(executor.plan_schema()).decode())
         else:
             owner = _owner(args)
-            if action == "plan":
+            if action == "report":
+                from . import managed_report
+                _emit(args, lambda: managed_report.build_report(owner, args.task_id, public=args.public))
+            elif action == "plan":
                 _emit(args, lambda: executor.create_plan(owner, args.task_id, artifact_ids=args.artifact_id,
                                                         deadline_seconds=args.deadline_seconds, public=args.public))
             elif action == "approve":
@@ -218,6 +221,8 @@ def add_commands(commands):
     reconcile = leaf("reconcile", "inspect pending identity; never repeat deletion", owner=True)
     reconcile.add_argument("--operation-id", required=True)
     reconcile.add_argument("--artifact-id", required=True)
+    accounting = leaf("report", "read-only unified managed task accounting; no state transition", owner=True)
+    accounting.add_argument("--task-id", required=True)
     plan = leaf("plan", "dry-run managed objects under broker fence", owner=True)
     plan.add_argument("--task-id", required=True)
     plan.add_argument("--artifact-id", action="append")

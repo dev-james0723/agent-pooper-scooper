@@ -65,6 +65,10 @@ Candidate apparent bytes, allocated bytes and filesystem capacity are distinct. 
 
 Public managed output omits store/task/object IDs, roots, socket names, plan hashes, capabilities and private receipt bindings. Public display objects cannot be used for execution. CLI errors are generic even outside public mode so unexpected input/transport exceptions cannot print capability contents or traceback paths. Private operator files must not be published.
 
+## Unified read-only task accounting
+
+After terminal state or collection, `aps managed report` joins one owner-fenced accounting view with verified historical creation, current retention, cumulative confirmed removal receipts and bounded unknown/audit facts. It works for recovery inspection and has no mutation/notification role. It never trusts caller-supplied receipts or turns missing files into successful unlinks. Unknown totals remain null with explicit known lower bounds; per-file allocated observations are not exclusive capacity. Collector invocation/replay accounting is unchanged. See [the full report contract](SCOOP_REPORT.md) before delivering a selected report through an explicitly configured notifier.
+
 ## Research and limits
 
 The design adapts coordination ideas, not source, from [containerd v2.4.2 metadata/GC locks](https://github.com/containerd/containerd/blob/b7a25261e029d68978bbf290df0a62fc819b3c51/core/metadata/db.go) (2026-10-13, Apache-2.0) and [BuildKit v0.34.1 serialized prune](https://github.com/moby/buildkit/blob/f5b59a1f2fb25a0cb7072c398cab9aed7835da4e/cache/manager.go) (commit 2026-10-07, Apache-2.0). Their Go/container/snapshot dependencies are not adopted. Prior planner research remains in [PHASE2.md](PHASE2.md). The runtime uses only existing Python standard-library modules; no third-party runtime dependency or upstream implementation was copied.

@@ -57,6 +57,17 @@ aps task-end task.json --events events.jsonl --evidence snapshot.json --public
 
 File evidence is an unauthenticated operator assertion, bound to the manifest digest and a short freshness window. The planner checks explicit root approvals, identity, terminal state, grace, complete reference/lease claims, Git/worktree and mount exclusions. Unknown means KEEP. Candidates are regular files only; even a `WOULD_REMOVE` result has execution **BLOCKED**. `--execute` returns exit 1 without performing cleanup. See [planner boundaries and research](docs/PHASE2.md).
 
+## Unified managed task reports
+
+After a producer records terminal state and the owner evaluates or collects its managed files:
+
+```sh
+aps managed report /physical/aps-store --owner-key-file /physical/owner.json \
+  --task-id configured-task --public --output /physical/new-scoop-report.json
+```
+
+This command only reads one fenced owner accounting view. It joins durable broker-attributed creation facts, current retained files and reasons, cumulative confirmed removal receipts, unknowns and audit facts. Unknown history stays null with qualified known lower bounds; missing objects are not invented removals. Cumulative report totals are separate from the collector's per-invocation accounting and zero-new-removal replay. Reclaimed capacity remains unknown. The whole report is compatible with explicit numeric-only notification delivery. Legacy `report`/`task-end` keep their read-only manifest semantics. See [the report contract](docs/SCOOP_REPORT.md).
+
 ## Explicit live observations and report delivery
 
 ```sh

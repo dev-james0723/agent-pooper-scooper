@@ -210,6 +210,28 @@ class InstalledCliSmoke(unittest.TestCase):
                 result = run(*owner_args("collect"), "--plan", plan_path, "--operation-id", "wheel-collect", "--approval-id", grant["approval_id"], "--execute", "--public")
                 self.assertEqual(result["removed"], {"count": 1, "bytes": len(payload.read_bytes())})
                 self.assertIsNone(result["reclaimed"]["bytes"])
+                unified_path = base / "unified-report.json"
+                run(*owner_args("report"), "--task-id", "wheel-task", "--output", unified_path, "--public")
+                unified = json.loads(unified_path.read_text())
+                self.assertEqual(unified["generated"]["apparent_bytes"], len(payload.read_bytes()) + len(protected.read_bytes()))
+                self.assertEqual(unified["retained"]["apparent_bytes"], len(protected.read_bytes()))
+                self.assertEqual(unified["removed"]["bytes"], len(payload.read_bytes()))
+                self.assertEqual(unified["removed"]["scope"], "cumulative_confirmed_receipts")
+                self.assertEqual(unified["unknowns"]["count"], 0)
+                self.assertIsNone(unified["reclaimed"]["bytes"])
+                # Hermetic delivery of the WHOLE generated report, never a real notification.
+                report_bridge = base / "report-bridge.py"
+                report_bridge.write_text("import json,sys\nrequest=json.load(sys.stdin)\n"
+                                         "assert request['tool']=='notify'\n"
+                                         "assert 'Reclaimed capacity unknown.' in request['arguments']['message']\n"
+                                         "print(json.dumps({'content':[{'type':'text','text':'Notification sent.'}]}))\n")
+                delivered = run("integrations", "notice", store, "--owner-key-file", key,
+                                "--report", unified_path, "--operation-id", "wheel-unified-notice",
+                                "--device-id", "fixture-device", "--mission-id", "fixture-mission",
+                                "--bridge-command-json", json.dumps([sys.executable, "-I", "-B", str(report_bridge)]),
+                                "--send", "--test-mode", "--public")
+                self.assertEqual(delivered["status"], "provider_acknowledged")
+                self.assertFalse(delivered["user_seen_verified"])
                 replay = run(*owner_args("collect"), "--plan", plan_path, "--operation-id", "wheel-collect", "--approval-id", grant["approval_id"], "--execute")
                 self.assertEqual(replay["status"], "IDEMPOTENT_REPLAY")
                 self.assertEqual(replay["removed"]["bytes"], 0)
