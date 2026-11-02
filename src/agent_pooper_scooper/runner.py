@@ -320,7 +320,8 @@ def _exit_code(state):
 
 
 def run_command(command, run_dir, *, clean_success=False, timeout=DEFAULT_TIMEOUT,
-                max_output_bytes=MAX_OUTPUT_BYTES, stdout=None, stderr=None):
+                max_output_bytes=MAX_OUTPUT_BYTES, stdout=None, stderr=None,
+                defer_cleanup=False, grace_seconds=1):
     """Run once. Return a private, content-free receipt and the process exit code.
 
     --clean-success is scoped owner authorization for only the wrapper-created
@@ -328,6 +329,9 @@ def run_command(command, run_dir, *, clean_success=False, timeout=DEFAULT_TIMEOU
     A fresh plan and exact grant are still checked by the existing executor.
     """
     _validate(command, run_dir, clean_success, timeout, max_output_bytes)
+    if (type(defer_cleanup) is not bool or type(grace_seconds) is not int
+            or not 1 <= grace_seconds <= 31536000):
+        raise RunnerError("invalid deferred policy")
     path = os.fspath(run_dir)
     state = {"status": "capturing", "started": False, "command_exit_code": None,
              "termination_status": "not_requested",
@@ -350,17 +354,19 @@ def run_command(command, run_dir, *, clean_success=False, timeout=DEFAULT_TIMEOU
                                          "schema_version": 1, "owner_key": owner.owner_key})
                 with _socket_directory() as socket_path, AuthorityServer(owner, socket_path) as server:
                     coordinator = ManagedTaskCoordinator.create(owner, server.socket_path, path + "/workflow")
-                    client = coordinator.enroll(_TASK, "command-output-wrapper", "enroll", grace_seconds=1)
+                    client = coordinator.enroll(_TASK, "command-output-wrapper", "enroll", grace_seconds=grace_seconds)
                     preview = coordinator.run_producer(
                         client, lambda producer: _capture(
                             producer, command, disposable=clean_success, timeout=timeout,
                             maximum=max_output_bytes, stdout=stdout, stderr=stderr, state=state), "capture")
                     receipt["accounting"] = preview["report"]
                     successful = state["status"] == "complete" and state["command_exit_code"] == 0
-                    if clean_success and successful and state["objects"]:
+                    if clean_success and successful and defer_cleanup:
+                        receipt["cleanup"]["status"] = "deferred"
+                    elif clean_success and successful and state["objects"]:
                         # The capture callable has returned; the broker revoked
                         # its generation. Honour the registered one-second grace.
-                        time.sleep(1.05)
+                        time.sleep(grace_seconds + 0.05)
                         selected = [obj["artifact_id"] for obj in state["objects"]]
                         plan = executor.create_plan(owner, _TASK, artifact_ids=selected)
                         if (set(plan["candidate"]["artifact_ids"]) != set(selected)

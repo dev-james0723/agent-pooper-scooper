@@ -16,3 +16,8 @@
 **/build/
 *.log
 *.sqlite
+
+# Native menu-bar build products and local evidence
+macos/APSMenuBar/.build/
+macos/APSMenuBar/.swiftpm/
+.superpowers/
