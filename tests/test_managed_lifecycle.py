@@ -281,6 +281,52 @@ class ManagedLifecycleTests(unittest.TestCase):
         self.assertEqual(result["status"], "AWAITING_APPROVAL")
         self.assertEqual(result["removed"], {"count": 0, "bytes": 0})
 
+    def _expired_grant_refusal_replays(self, send):
+        preview = self.run_task()
+        time.sleep(1.05)
+        plan = executor.create_plan(self.owner, "private-task")
+        grant = executor.approve_plan(self.owner, plan, "expired-operation", ttl_seconds=1)
+        time.sleep(1.05)
+        snapshot = self.owner.snapshot("private-task")
+        self.assertEqual(snapshot["revision"], plan["revision"])
+        self.assertEqual(snapshot["producer_generation"], plan["producer_generation"])
+        calls = []
+        def ack(name, arguments):
+            calls.append((name, arguments))
+            return {"content": [{"type": "text", "text": "Notification sent."}]}
+        kwargs = dict(execute=True, plan=plan, approval_id=grant["approval_id"],
+                      operation_id="expired-operation", send=send)
+        if send:
+            kwargs.update(callback=ack, device_id="device", mission_id="mission")
+        with mock.patch.object(executor, "collect", wraps=executor.collect) as collect, \
+                mock.patch("os.unlink", side_effect=AssertionError("expired grant must not unlink")):
+            first = self.coord.task_end("private-task", "expired-request", **kwargs)
+            self.assertEqual(first["status"], "AWAITING_APPROVAL")
+            self.assertEqual(first["report"], preview["report"])
+            self.assertEqual(first["report_revision"], 0)
+            reopened = lifecycle.ManagedTaskCoordinator(self.owner, self.server.socket_path, self.path)
+            for alias in ("new-expired-alias", "expired-request"):
+                with self.subTest(send=send, alias=alias):
+                    replay = reopened.task_end("private-task", alias, **kwargs)
+                    self.assertEqual(replay["report"], first["report"])
+                    self.assertEqual(replay["report_revision"], first["report_revision"])
+                    self.assertEqual(replay["removed"], {"count": 0, "bytes": 0})
+                    self.assertEqual(replay["delivery"], first["delivery"])
+            self.assertEqual(collect.call_count, 1)
+        self.assertEqual(len(calls), 1 if send else 0)
+        self.assertEqual(self.owner.pending_operations(), [])
+        self.assertIsNone(self.owner.operation_receipts("expired-operation", plan["plan_digest"],
+                          grant["approval_id"], plan["candidate"]["artifact_ids"]))
+        self.assertEqual(sorted(p.read_bytes() for p in (self.base / "store" / "artifacts").iterdir()),
+                         sorted([bytes(range(17)), b"p" * 23]))
+        self.assertEqual(self.original.read_bytes(), b"unmanaged original must remain")
+
+    def test_expired_grant_refusal_reopens_without_a_new_report_or_delivery(self):
+        self._expired_grant_refusal_replays(send=True)
+
+    def test_expired_grant_refusal_without_delivery_keeps_the_preview_revision(self):
+        self._expired_grant_refusal_replays(send=False)
+
     def test_resume_alias_does_not_rotate_an_already_resumed_generation(self):
         self.run_task()
         first = self.coord.resume("private-task", "resume")

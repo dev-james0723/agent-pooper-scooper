@@ -486,7 +486,8 @@ class ManagedTaskCoordinator:
                     self._finish(slot, result, workflow)
             else:
                 result = self._claim(slot, binding, request_id);replay = True
-            if phase != "preview" and old is None and result["status"] == "AWAITING_APPROVAL":
+            # Known refusals keep the preview slot on both first call and replay.
+            if phase != "preview" and result["status"] == "AWAITING_APPROVAL":
                 phase = "preview"
         sealed, report_replay = self._seal(workflow, phase, result, "life:" + _hash([wid, phase, "report"]))
         result = json.loads(_json(sealed))
