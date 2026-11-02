@@ -226,6 +226,11 @@ class TaskRunnerTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         self.addCleanup(os.close, read_fd)
         with os.fdopen(write_fd, "wb", buffering=0) as sink:
+            # A plain first write changes kernel-maintained F_GETFL bits on
+            # Darwin. Establish that control before comparing restored flags;
+            # _mirror must preserve the caller's actual I/O mode.
+            os.write(write_fd, b"control")
+            self.assertEqual(os.read(read_fd, 7), b"control")
             original = fcntl.fcntl(write_fd, fcntl.F_GETFL)
             runner._mirror(sink, b"prefix", deadline=time.monotonic() + 0.2)
             self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), original)
@@ -238,6 +243,8 @@ class TaskRunnerTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         self.addCleanup(os.close, read_fd)
         with os.fdopen(write_fd, "wb", buffering=0) as sink:
+            os.write(write_fd, b"control")
+            self.assertEqual(os.read(read_fd, 7), b"control")
             os.set_blocking(write_fd, False)
             original = fcntl.fcntl(write_fd, fcntl.F_GETFL)
             runner._mirror(sink, b"bytes", deadline=time.monotonic() + 0.2)
