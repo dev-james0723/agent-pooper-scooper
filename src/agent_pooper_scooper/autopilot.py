@@ -270,6 +270,12 @@ def tick(state_dir):
                     skip('lifecycle_or_recovery')
                     continue
                 plan = executor.create_plan(owner, runner._TASK, artifact_ids=row['objects'], deadline_seconds=2)
+                # A resume/re-completion can occur after the preliminary snapshot.
+                # Bind the fenced fresh plan to this enrollment, not merely to
+                # the latest terminal generation of the same task identifier.
+                if plan['producer_generation'] != row['generation']:
+                    skip('lifecycle_or_recovery')
+                    continue
                 if (set(plan['candidate']['artifact_ids']) != set(row['objects'])
                         or plan['candidate']['apparent_bytes'] != row['captured_bytes']):
                     skip('executor_protection')
