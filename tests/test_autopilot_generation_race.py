@@ -11,6 +11,12 @@ from autopilot_support import inprocess_broker
 
 class GenerationRaceTests(unittest.TestCase):
     def test_resume_and_recomplete_between_snapshot_and_plan_never_grants(self):
+        self.assert_generation_is_retained("completed")
+
+    def test_resume_and_fail_between_snapshot_and_plan_never_grants(self):
+        self.assert_generation_is_retained("failed")
+
+    def assert_generation_is_retained(self, terminal_status):
         with tempfile.TemporaryDirectory() as tmp, inprocess_broker(), \
              mock.patch.object(executor_platform,'observe',side_effect=lambda fd,path:{'canonical_root':path,'backend':'fixture'}):
             state=Path(tmp).resolve()/'policy'
@@ -23,7 +29,7 @@ class GenerationRaceTests(unittest.TestCase):
             original=executor.create_plan
             def resumed_plan(owner,task_id,**kwargs):
                 credentials=owner.resume(task_id)
-                owner.producer_call(credentials,'terminal',{'status':'completed'})
+                owner.producer_call(credentials,'terminal',{'status':terminal_status})
                 time.sleep(1.05)
                 plan=original(owner,task_id,**kwargs)
                 self.assertGreater(plan['producer_generation'],enrolled_generation)
