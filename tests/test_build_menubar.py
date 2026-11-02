@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 import plistlib
+import shutil
+import subprocess
 import hashlib
 import json
 from unittest import mock
@@ -16,7 +18,26 @@ class BundleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
-        self.repo = Path(__file__).resolve().parents[1]
+        source = Path(__file__).resolve().parents[1]
+        # Publication tests run immutable source snapshots without VCS metadata.
+        # Assembly still requires real provenance; provide our own Git fixture
+        # rather than depending on the checkout containing this test module.
+        self.repo = self.base / "source-checkout"
+        (self.repo / "src").mkdir(parents=True)
+        shutil.copytree(source / "src/agent_pooper_scooper",
+                        self.repo / "src/agent_pooper_scooper",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
+                    "GIT_AUTHOR_EMAIL": "fixture@users.noreply.github.com",
+                    "GIT_COMMITTER_EMAIL": "fixture@users.noreply.github.com"})
+        for args in (("init", "-q", "-b", "main"), ("add", "src"),
+                     ("commit", "-qm", "synthetic engine fixture")):
+            subprocess.run(["git", *args], cwd=self.repo, env=env, check=True,
+                           capture_output=True)
+        self.source_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, env=env, text=True).strip()
         self.binary = self.base / "APSMenuBar"
         self.binary.write_bytes(bytes.fromhex("cffaedfe") + b"fixture executable")
         self.binary.chmod(0o700)
@@ -35,6 +56,7 @@ class BundleTests(unittest.TestCase):
         self.assertFalse(list(resources.rglob("config.json")))
         self.assertFalse(list(resources.rglob("owner.json")))
         self.assertTrue(result["source_sha256"])
+        self.assertEqual(result["engine_source_commit"], self.source_commit)
 
     def test_detached_receipt_hashes_final_signed_bytes(self):
         original = build_menubar.subprocess.run

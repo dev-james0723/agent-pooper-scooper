@@ -1,5 +1,8 @@
 # Native macOS menu-bar preview
 
+Build from a real Git checkout: the bundle builder requires Git provenance.
+A source archive alone does not establish that provenance.
+
 The native app is a small SwiftUI status item, not a browser dashboard. Click its
 sparkles icon for Overview, Review, History and Settings. It reads actual volume
 capacity and the existing monitor's separately timestamped bounded inventory.
