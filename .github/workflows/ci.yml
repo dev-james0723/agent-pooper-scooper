@@ -73,3 +73,4 @@ jobs:
           "$RUNNER_TEMP/aps-runtime/bin/python" -m pip check
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_cli_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"
+          "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_preview_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"

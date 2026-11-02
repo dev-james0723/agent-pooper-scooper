@@ -1,7 +1,7 @@
-"""Agent Pooper Scooper: task-aware, observe-only disk accounting (phase 1).
+"""Native disk reports and explicitly scoped managed-artifact collection.
 
-Phase 1 is read-only. Nothing in this package deletes, moves or modifies
-artifacts; it only validates manifests, measures disk usage and reports.
+Native inventory is read-only. The separate closed-store collector may remove
+only APS-created artifacts under its owner-approved execution contract.
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0a1"

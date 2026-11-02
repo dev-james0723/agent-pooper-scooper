@@ -1,6 +1,7 @@
 """Run against an installed wheel: python3 tests/installed_cli_smoke.py /path/to/aps."""
 import json
 import hashlib
+import importlib.metadata
 from datetime import datetime, timedelta, timezone
 import os
 import signal
@@ -340,7 +341,7 @@ class InstalledCliSmoke(unittest.TestCase):
                     self.assertNotIn(str(base), process.stdout + process.stderr)
                 return process.stdout
 
-            self.assertIn("aps 0.1.0.dev0", run("--version"))
+            self.assertEqual(run("--version").strip(), "aps " + importlib.metadata.version("agent-pooper-scooper"))
             run("manifest", "init", manifest, "--task-id", "smoke-1", "--producer", "fixture",
                 "--host", "fixture-host", "--root", root)
             run("manifest", "record", manifest, build, "--class", "build-output", "--disposable")

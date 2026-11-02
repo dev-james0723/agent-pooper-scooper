@@ -6,7 +6,41 @@
 
 Agent Pooper Scooper is an open-source project for **task-aware, safety-first disk cleanup and friendly Scoop Reports**. The goal: reclaim disposable scratch space without destroying work that AI coding agents, other tasks, or future resumed sessions might still need.
 
-> **Project status: pre-alpha / managed executor development.** Legacy manifests, telemetry, reports and file/null evidence planning remain read-only, with their execution BLOCKED. The experimental `aps managed` commands can collect explicitly approved regular files created by the APS producer broker in a new closed store. They cannot adopt existing user data or provide host-wide cleanup. Independent authority/executor/integration acceptance remains required; background cleaning and global native lifecycle authority are unavailable.
+> **Preview 0.1.0a1: native disk reports, a scheduled macOS monitor, and a foreground task-output runner.** Inspect real agent/project disk usage immediately. Run a batch command with `aps run` to capture its new diagnostic output and, with `--clean-success`, collect only that output after complete success. Existing native files, worktrees, caches and session histories remain outside cleanup. This is a usable bounded preview; it is not a general automatic cleaner for historical agent data.
+
+## Start here
+
+The preview needs Python **3.10+**. Its runtime uses only the standard library.
+Install a verified release wheel in a virtual environment, or use the
+[macOS installer](docs/INSTALL.md) to add the `aps` command, a desktop report
+shortcut and a low-overhead login monitor. No orchestrator is needed.
+
+```sh
+aps host scan --format markdown
+aps host pressure --format markdown
+
+# The parent must already exist and be owner-controlled. Each run directory is new.
+aps run --run-dir "$PWD/new-diagnostic-run" --clean-success -- python3 -m unittest discover
+```
+
+`aps host scan` reports selected native locations, their measured sizes,
+incomplete measurements and disk availability. It keeps every existing file.
+The macOS monitor checks capacity every 15 minutes and refreshes its bounded
+inventory every six hours; low-space desktop alerts have a six-hour cooldown.
+
+`aps run` is for noninteractive diagnostic, test or build commands. It streams
+and captures at most 16 MiB of newly produced stdout/stderr into its own store.
+Without `--clean-success`, captured output stays retained. With that option,
+only completely captured output from a successful command is eligible for the
+existing exact-plan collector. Failure, timeout, interruption, a capture limit
+or uncertainty keeps the data. The command's own files are never cleaned.
+Each run keeps a private `report.json`, owner capability and audit records;
+confirmed removed blob bytes do not imply net disk savings or reclaimed APFS
+capacity. Small runs can retain more metadata than the output they remove.
+
+See [native reports](docs/HOST_REPORTS.md), [the task runner](docs/TASK_RUNNER.md),
+and [installation and monitoring](docs/INSTALL.md). Do not wrap an entire
+coding-agent session with disposable-output cleanup: its output may be valuable.
 
 ## Why?
 
@@ -20,13 +54,14 @@ Coding agents can generate gigabytes of build outputs, test caches, temporary fi
 - **Managed collection** — explicitly approve a fresh plan for broker-created disposable regular files, with terminal/grace checks, unreleased-reference/lease protection, durable intent and receipt accounting. Dry-run is the default; existing directories cannot be adopted.
 - **Scoop Reports** — legacy reports distinguish measured, retained, candidate, unknown and skipped accounting with zero removal. Managed collection separately reports durable verified unlink bytes and replay/recovery outcomes; reclaimed capacity remains unknown.
 - **Read-only telemetry** — volume capacity via `statvfs`, bounded registered-root walks, hardlink deduplication, symlink refusal, mount-boundary skips, and explicit unknowns.
-- **Provider-neutral events** — versioned strict schemas and JSON Lines validation. Automatic integrations remain future work.
+- **Provider-neutral events** — versioned strict schemas and JSON Lines validation. Native session enrollment remains future work.
 - **Managed producer lifecycle** — opaque object IDs and bytes, explicit reference/lease release, revoked generation tokens on terminal state, and owner-controlled resume. Every participating operation uses the same broker fence.
-- **Future capabilities** — background pressure alerts, broader task-end automation and optional independently verified provider transports. Native-global reference/resume authority is unavailable.
+- **Workstation entry points** — bounded native inventory, a scheduled pressure monitor, and a direct command-output runner with private receipts.
+- **Future capabilities** — broader task-end automation and native producer integrations. Native-global reference/resume authority is unavailable.
 
 A disposable flag or terminal event never grants deletion authority. See [managed execution safety](docs/EXECUTION_SAFETY.md) for the separate closed-store owner approval, producer fence, recovery protocol and unsupported containment assumptions. No existing manifest or native snapshot can authorize that executor.
 
-## Install and try Phase 1
+## Advanced manifest-based reporting
 
 Requires Python **3.10+** on macOS/POSIX. Runtime dependencies are entirely standard library. Builds use setuptools 58+ and wheel; provision approved build tools first for offline installation:
 
@@ -88,7 +123,8 @@ This is a cooperative protocol, not a Python sandbox or automatic native
 AO/Kynlo enrollment. Producer artifacts must be broker-owned from creation;
 copying an unmanaged input does not reclaim its original. Existing user/native
 data stays outside execution. See [lifecycle setup, bounds and remaining
-acceptance gates](docs/MANAGED_LIFECYCLE.md). No background service is installed.
+acceptance gates](docs/MANAGED_LIFECYCLE.md). The SDK alone installs no service;
+the separate macOS installer can enable the read-only disk monitor.
 
 ## Unified managed task reports
 

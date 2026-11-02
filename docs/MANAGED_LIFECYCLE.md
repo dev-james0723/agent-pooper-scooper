@@ -1,8 +1,9 @@
 # Managed lifecycle SDK — local development component
 
-This component is pending exact independent source and runtime review. It is
-not a native AO/Kynlo producer integration, installation or release. Existing
-user/native roots remain unmanaged. The current reviewed draft is preserved.
+This component supports explicitly cooperating producers. It is not a native
+AO/Kynlo producer integration; existing user/native roots remain unmanaged.
+The workstation preview adds a separate command-output wrapper using this
+SDK, with the wrapper as its sole producer. See [the task runner](TASK_RUNNER.md).
 
 `ManagedTaskCoordinator.create(owner, socket_path, journal_path)` exclusively
 creates a private workflow journal outside an existing **APS-created** store.

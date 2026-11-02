@@ -234,6 +234,10 @@ def build_parser():
     managed_cli.add_commands(commands)
     from . import integration_cli
     integration_cli.add_commands(commands)
+    from . import host_cli, monitor, run_cli
+    host_cli.add_commands(commands)
+    monitor.add_commands(commands)
+    run_cli.add_commands(commands)
     return parser
 
 
