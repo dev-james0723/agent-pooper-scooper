@@ -72,6 +72,10 @@ descendant keeping a pipe open beyond the bounded drain interval makes capture
 incomplete. On timeout/error the wrapper signals only the separate command
 process group it created; it does not target unrelated operating-system jobs.
 Processes that deliberately leave that group are outside its containment.
+The receipt records `command.termination_status` separately from the capture
+reason. A denied signal is reported as `permission_denied`, is not retried, and
+does not mean the group is confirmed stopped. Output stays retained and the
+original incomplete-capture or timeout exit status is preserved.
 
 ## Failure and exit status
 

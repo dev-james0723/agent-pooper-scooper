@@ -28,7 +28,8 @@ dependencies and the installed CLI version.
 ## Installed entry points
 
 - `~/.local/bin/aps` links to the versioned virtual environment.
-- `~/Desktop/Agent-Pooper-Scooper.command` opens a current native disk report.
+- `~/Desktop/Agent-Pooper-Scooper.command` runs the bounded monitor tick and opens
+  its Markdown report, including current pressure and inventory status/age.
 - `~/Library/LaunchAgents/io.agent-pooper-scooper.monitor.plist` registers a
   low-priority pressure/report monitor every 15 minutes and at login.
 - `~/.local/share/agent-pooper-scooper/releases/<version>/venv` contains the
@@ -52,6 +53,51 @@ LaunchAgent registration is checked through `launchctl print`; registration
 does not itself prove a completed report or a visible notification. Inspect
 the monitor status for actual run evidence. Native disk reporting remains
 read-only, and managed collection still requires its separate explicit scope.
+
+### Slow or unavailable inventory locations
+
+Each tick saves its fresh capacity report before starting a detailed inventory.
+If a low-space notification is due, its durable intent and provider result are
+also recorded before the inventory begins. The saved capacity result therefore
+remains available when a native directory is slow or blocked.
+
+Inventory runs in a separate read-only process with a **30-second supervision
+deadline**, a four-MiB output cap, and the existing entry/depth limits. Use
+`--scan-timeout-seconds` on `monitor tick` to select 1–300 seconds. This deadline
+does not bound the entire tick: capacity/state filesystem operations and the
+notification provider have their own behavior; a notification has a separate
+ten-second timeout. The worker receives no monitor directory descriptor, output
+path or producer/owner credentials. Python bytecode writes are disabled.
+
+`scan_status` records the latest attempt separately from `last_scan_epoch`,
+which changes only after a completed inventory. A timed-out, invalid or failed
+attempt preserves the last successful inventory and its original measurement
+timestamp. Failed attempts use the same default six-hour retry interval as
+successful scans, while capacity checks continue every 15 minutes. An explicit
+change of roots requests a new attempt. `scan_performed` is true only when this
+tick obtains a completed inventory; `scan_attempted` also records unsuccessful
+attempts.
+
+On a timeout, the parent signals only the child it owns and waits at most one
+additional second for that child. A process stuck in kernel I/O may remain
+alive; the report then says `termination_pending`. The worker holds an inherited
+**read-only inventory lease**, separate from the monitor's writer lock. The
+parent closes its own lease descriptor without unlocking it. This prevents a
+later tick from launching another inventory while the old worker remains
+alive, without blocking fresh capacity reports. The kernel releases the lease
+when the worker exits, allowing a later scheduled attempt. Saved worker PIDs
+are diagnostic only; a later tick never sends a signal to a saved PID.
+
+The Desktop shortcut uses the bounded monitor command. For a readable saved
+report without starting a scan, run:
+
+```sh
+~/.local/bin/aps monitor status --state-dir ~/.local/share/agent-pooper-scooper/monitor --format markdown
+```
+
+Markdown separates the fresh capacity timestamp from the last completed
+inventory's timestamp. `--public` output intentionally omits native inventory
+details and retains only the validated monitor summary.
 
 `--no-start` installs the package, shortcut and plist without registering or
 starting the service. `--prefix` selects a new directory inside your home for

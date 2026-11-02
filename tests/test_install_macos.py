@@ -187,7 +187,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(paths["plist"].stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(paths["error_log"].stat().st_mode), 0o600)
         shortcut = paths["shortcut"].read_text().splitlines()[1]
-        self.assertEqual(shlex.split(shortcut), ["exec", str(paths["aps"]), "host", "scan", "--format", "markdown"])
+        self.assertEqual(shlex.split(shortcut), ["exec", str(paths["aps"]), "monitor", "tick",
+                                               "--state-dir", str(paths["state_dir"]), "--format", "markdown"])
         configuration = plistlib.loads(paths["plist"].read_bytes())
         self.assertEqual(configuration["ProgramArguments"], plan["program_arguments"])
         self.assertEqual(configuration["StartInterval"], 900)

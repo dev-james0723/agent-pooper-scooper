@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
 import tempfile
@@ -134,6 +135,70 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual(code, 125)
         self.assertEqual(receipt["command"]["capture_status"], "incomplete_pipes")
         self.assertFalse(receipt["cleanup"]["attempted"])
+
+    def test_denied_second_signal_preserves_capture_reason_and_retains_output(self):
+        sentinel = self.base / "resumable-session.json"
+        sentinel.write_bytes(b"keep this session")
+        original = os.killpg
+
+        def deny_second(pid, selected):
+            if selected == signal.SIGKILL:
+                raise PermissionError(1, "fixture disappearing group")
+            return original(pid, selected)
+
+        source = ("import os,time; os.write(1,b'retained diagnostic'); "
+                  "pid=os.fork(); time.sleep(30) if pid==0 else None")
+        with mock.patch.object(runner, "PIPE_DRAIN_SECONDS", 0.2), \
+                mock.patch.object(runner.os, "killpg", side_effect=deny_second) as stop, \
+                mock.patch.object(runner.executor, "approve_plan", side_effect=AssertionError("must retain")):
+            receipt, code = self.run_task(source, timeout=5, clean_success=True)
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt["command"]["capture_status"], "incomplete_pipes")
+        self.assertEqual(receipt["command"]["termination_status"], "permission_denied")
+        self.assertEqual(stop.call_count, 2)
+        self.assertFalse(receipt["cleanup"]["attempted"])
+        self.assertEqual(receipt["cleanup"]["removed"], {"count": 0, "bytes": 0})
+        self.assertEqual(self.blobs()[0].read_bytes(), b"retained diagnostic")
+        self.assertEqual(sentinel.read_bytes(), b"keep this session")
+
+    def test_denied_first_signal_is_reported_without_retry_or_unbounded_wait(self):
+        process = mock.Mock(pid=12345)
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError(1, "fixture denial")) as stop:
+            self.assertEqual(runner._stop_owned(process), "permission_denied")
+        stop.assert_called_once_with(process.pid, signal.SIGTERM)
+        process.wait.assert_not_called()
+
+    def test_absent_group_is_not_signalled_again(self):
+        process = mock.Mock(pid=12345)
+        with mock.patch.object(runner.os, "killpg", side_effect=ProcessLookupError()) as stop:
+            self.assertEqual(runner._stop_owned(process), "group_absent")
+        stop.assert_called_once_with(process.pid, signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=0.3)
+
+    def test_denied_signal_is_not_retried_after_broker_flush_failure(self):
+        sentinel = self.base / "resumable-session.json"
+        sentinel.write_bytes(b"keep this session")
+        original = os.killpg
+
+        def deny_second(pid, selected):
+            if selected == signal.SIGKILL:
+                raise PermissionError(1, "fixture disappearing group")
+            return original(pid, selected)
+
+        source = ("import os,time; os.write(1,b'unacknowledged diagnostic'); "
+                  "pid=os.fork(); time.sleep(30) if pid==0 else None")
+        with mock.patch.object(runner, "PIPE_DRAIN_SECONDS", 0.2), \
+                mock.patch.object(runner.os, "killpg", side_effect=deny_second) as stop, \
+                mock.patch.object(ProducerClient, "write", side_effect=OSError("fixture full disk")) as write:
+            receipt, code = self.run_task(source, timeout=5, clean_success=True)
+        self.assertEqual(code, 125)
+        self.assertEqual(receipt["command"]["capture_status"], "capture_error")
+        self.assertEqual(receipt["command"]["termination_status"], "permission_denied")
+        self.assertEqual(stop.call_count, 2)
+        self.assertEqual(write.call_count, 1)
+        self.assertFalse(receipt["cleanup"]["attempted"])
+        self.assertEqual(receipt["cleanup"]["removed"], {"count": 0, "bytes": 0})
+        self.assertEqual(sentinel.read_bytes(), b"keep this session")
 
     def test_existing_or_symlink_run_directory_is_never_adopted(self):
         self.run_dir.mkdir()

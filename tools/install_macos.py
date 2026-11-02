@@ -263,7 +263,9 @@ def install(plan, *, platform=None, runner=subprocess.run, builder=None):
         os.symlink(str(paths["aps"]), paths["wrapper"].name, dir_fd=parent)
     finally:
         os.close(parent)
-    shortcut = "#!/bin/sh\nexec " + shlex.quote(str(paths["aps"])) + " host scan --format markdown\n"
+    shortcut = ("#!/bin/sh\nexec " + shlex.quote(str(paths["aps"]))
+                + " monitor tick --state-dir " + shlex.quote(str(paths["state_dir"]))
+                + " --format markdown\n")
     _write_new(paths["shortcut"], shortcut.encode("utf-8"), 0o700)
     _write_new(paths["error_log"], b"")
     # monitor tick creates and authenticates its own private state directory.

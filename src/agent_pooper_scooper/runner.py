@@ -162,20 +162,33 @@ def _mirror(stream, data, *, deadline):
 
 
 def _stop_owned(process):
-    """Signal only the separate session/process group created by this wrapper."""
+    """Bounded signals to the owned group; never imply confirmed descendant exit.
+
+    Darwin can deny the second signal while an already-exited group disappears.
+    A denial is still uncertainty, not proof of exit: retain the original capture
+    failure and report it separately without retrying the denied group.
+    """
     for sig, wait in ((signal.SIGTERM, 0.3), (signal.SIGKILL, 0.7)):
+        outcome = "signals_sent"
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
-            pass
+            outcome = "group_absent"
+        except PermissionError:
+            return "permission_denied"
         try:
             process.wait(timeout=wait)
         except subprocess.TimeoutExpired:
+            if outcome == "group_absent":
+                return "leader_unreaped"
             continue
+        if outcome == "group_absent":
+            return outcome
         # Even if the leader exited, remaining members can hold capture pipes.
         if sig == signal.SIGTERM:
             continue
-        return
+        return outcome
+    return "leader_unreaped"
 
 
 def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, state):
@@ -187,6 +200,16 @@ def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, s
     started = time.monotonic()
     exited_at = None
     write_in_progress = False
+
+    def stop_once():
+        if process is None:
+            return
+        if state["termination_status"] == "not_requested":
+            # Record the attempt before signalling. A later broker/write
+            # failure must not retry a denied or uncertain process group.
+            state["termination_status"] = "stop_outcome_unknown"
+            state["termination_status"] = _stop_owned(process)
+        state["command_exit_code"] = process.poll()
 
     def flush(name):
         nonlocal write_in_progress
@@ -251,24 +274,19 @@ def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, s
             state["status"] = "complete"
             state["command_exit_code"] = process.wait(timeout=0.5)
         else:
-            _stop_owned(process)
-            state["command_exit_code"] = process.poll()
+            stop_once()
         for name in buffers:
             flush(name)
     except _MirrorTimeout:
         state["status"] = "timed_out"
-        if process is not None:
-            _stop_owned(process)
-            state["command_exit_code"] = process.poll()
+        stop_once()
         # Bytes already observed remain in the broker even if they could not
         # all reach the caller's sink. No cleanup is permitted for this run.
         for name in buffers:
             flush(name)
     except KeyboardInterrupt:
         state["status"] = "interrupted"
-        if process is not None:
-            _stop_owned(process)
-            state["command_exit_code"] = process.poll()
+        stop_once()
         if write_in_progress:
             # An interrupted broker request may already have taken effect.
             # Do not repeat it or record a known terminal transition.
@@ -279,9 +297,7 @@ def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, s
             flush(name)
     except Exception:
         state["status"] = "capture_error"
-        if process is not None:
-            _stop_owned(process)
-            state["command_exit_code"] = process.poll()
+        stop_once()
         raise RunnerError("capture refused or outcome uncertain") from None
     finally:
         selector.close()
@@ -314,6 +330,7 @@ def run_command(command, run_dir, *, clean_success=False, timeout=DEFAULT_TIMEOU
     _validate(command, run_dir, clean_success, timeout, max_output_bytes)
     path = os.fspath(run_dir)
     state = {"status": "capturing", "started": False, "command_exit_code": None,
+             "termination_status": "not_requested",
              "accepted_bytes": 0, "observed_bytes": 0, "captured_bytes": 0,
              "stream_bytes": {"stdout": 0, "stderr": 0}, "objects": []}
     receipt = {"schema": "agent-pooper-scooper/task-run", "schema_version": 1,
@@ -383,7 +400,8 @@ def run_command(command, run_dir, *, clean_success=False, timeout=DEFAULT_TIMEOU
                         if receipt["cleanup"]["attempted"]:
                             receipt["cleanup"]["removed"] = {"count": None, "bytes": None}
             receipt["command"] = {"started": state["started"], "exit_code": state["command_exit_code"],
-                                  "capture_status": state["status"], "wrapper_exit_code": _exit_code(state)}
+                                  "capture_status": state["status"], "wrapper_exit_code": _exit_code(state),
+                                  "termination_status": state["termination_status"]}
             receipt["capture"] = {"complete": state["status"] == "complete",
                                   "limit_bytes": max_output_bytes, "observed_bytes": state["observed_bytes"],
                                   "stored_bytes": state["captured_bytes"], "streams": state["stream_bytes"],
