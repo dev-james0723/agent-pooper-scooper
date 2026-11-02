@@ -1,0 +1,76 @@
+name: Safety and tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Publication Gate / Python Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Verified upstream tag refs and MIT licenses on 2026-11-01; see docs/AO_SYNC.md.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Publication gate (public repo only)
+        run: python3 tools/publication_gate.py --repo .
+      - name: Python tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Compile Python sources
+        run: python3 -m compileall -q src tools tests
+
+  package:
+    name: Platform Packaging (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        python:
+          - '3.10'
+          - '3.15'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and safety tests
+        run: python3 -B -m unittest discover -s tests -v
+      - name: Provision declared build requirements
+        run: python3 -m pip install --disable-pip-version-check 'setuptools>=58' wheel
+      - name: Build sdist and wheel from sdist
+        env:
+          APS_DIST_DIR: ${{ runner.temp }}/aps-dist
+        run: |
+          mkdir -p "$APS_DIST_DIR"
+          python3 -c "import os, setuptools.build_meta as backend; backend.build_sdist(os.environ['APS_DIST_DIR'])"
+          python3 -m pip wheel --no-index --no-deps --no-build-isolation "$APS_DIST_DIR/"*.tar.gz --wheel-dir "$APS_DIST_DIR"
+      - name: Install offline and verify installed CLI
+        env:
+          APS_DIST_DIR: ${{ runner.temp }}/aps-dist
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aps-runtime"
+          "$RUNNER_TEMP/aps-runtime/bin/python" -m pip install --no-index --no-deps "$APS_DIST_DIR/"*.whl
+          "$RUNNER_TEMP/aps-runtime/bin/python" -m pip check
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_cli_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"
+          "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_preview_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"
