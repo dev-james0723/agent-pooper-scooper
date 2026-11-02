@@ -51,6 +51,16 @@ limit. The command timeout defaults to 3,600 seconds and can be set with
 `--timeout` up to 86,400 seconds. Exceeding the output cap terminates the owned
 command group and retains the captured prefix. No unbounded spill file is used.
 
+Pipe and terminal mirroring uses nonblocking descriptor writes against the same
+command deadline. A caller that stops reading stdout or stderr cannot suspend
+that deadline; timed-out capture retains the bytes already observed and skips
+collection. Original descriptor flags are restored. The final CLI summary has
+its own short bounded write budget and may be omitted when stderr is full;
+`report.json` remains available. No background writer thread or deferred Python
+output buffer is left behind. Embedded use accepts native Python file streams
+or exact `io.BytesIO`/`io.StringIO` memory streams; arbitrary custom `write` or
+`flush` callbacks are unsupported because their blocking behavior is unknown.
+
 `report.json` separates the command's actual exit code, capture completion,
 collection result, confirmed removed bytes and unknown reclaimed disk capacity.
 The owner key, broker ledger, lifecycle journal and report are retained even

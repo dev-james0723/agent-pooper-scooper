@@ -6,10 +6,13 @@ native agent data are never enrolled or removed. This is not a sandbox.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import fcntl
+import io
 import json
 import math
 import os
 import selectors
+import select
 import signal
 import stat
 import subprocess
@@ -29,6 +32,10 @@ _TASK = "captured-command-output"
 
 class RunnerError(ValueError):
     """A content-free refusal; never expose command arguments or capabilities."""
+
+
+class _MirrorTimeout(RunnerError):
+    """The command deadline also bounds pipe/terminal output backpressure."""
 
 
 def _validate(command, run_dir, clean_success, timeout, max_output_bytes):
@@ -111,15 +118,47 @@ def _socket_directory():
         os.close(parent)
 
 
-def _mirror(stream, data):
+def _mirror(stream, data, *, deadline):
+    """Write bounded bytes without buffering behind a blocking Python stream.
+
+    Native descriptors temporarily use O_NONBLOCK, including after readiness:
+    readiness alone does not make a large write safe. Restore every original
+    status flag on all exits. Exact in-memory streams support embedding/tests;
+    arbitrary Python write/flush implementations are deliberately unsupported.
+    """
     if stream is None:
         return
-    target = getattr(stream, "buffer", stream)
+    if time.monotonic() >= deadline:
+        raise _MirrorTimeout("output sink deadline expired")
+    if type(stream) is io.BytesIO:
+        stream.write(data)
+        return
+    if type(stream) is io.StringIO:
+        stream.write(data.decode("utf-8", errors="replace"))
+        return
+    if type(stream) not in (io.TextIOWrapper, io.BufferedWriter, io.BufferedRandom, io.FileIO):
+        raise RunnerError("output sink must be a native descriptor or exact memory stream")
+    fd = stream.fileno()
+    original = fcntl.fcntl(fd, fcntl.F_GETFL)
     try:
-        target.write(data)
-    except TypeError:
-        target.write(data.decode("utf-8", errors="replace"))
-    target.flush()
+        fcntl.fcntl(fd, fcntl.F_SETFL, original | os.O_NONBLOCK)
+        pending = memoryview(data)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _MirrorTimeout("output sink deadline expired")
+            try:
+                count = os.write(fd, pending[:4096])
+            except BlockingIOError:
+                select.select([], [fd], [], min(remaining, 0.05))
+                continue
+            except InterruptedError:
+                continue
+            if count <= 0:
+                raise RunnerError("output sink made no progress")
+            pending = pending[count:]
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, original)
 
 
 def _stop_owned(process):
@@ -202,7 +241,7 @@ def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, s
                     accepted = accepted[take:]
                     if len(buffers[name]) == MAX_BYTES:
                         flush(name)
-                _mirror(targets[name], mirrored)
+                _mirror(targets[name], mirrored, deadline=started + timeout)
                 if len(data) > remaining:
                     state["status"] = "output_limit"
                     break
@@ -214,6 +253,15 @@ def _capture(client, command, *, disposable, timeout, maximum, stdout, stderr, s
         else:
             _stop_owned(process)
             state["command_exit_code"] = process.poll()
+        for name in buffers:
+            flush(name)
+    except _MirrorTimeout:
+        state["status"] = "timed_out"
+        if process is not None:
+            _stop_owned(process)
+            state["command_exit_code"] = process.poll()
+        # Bytes already observed remain in the broker even if they could not
+        # all reach the caller's sink. No cleanup is permitted for this run.
         for name in buffers:
             flush(name)
     except KeyboardInterrupt:

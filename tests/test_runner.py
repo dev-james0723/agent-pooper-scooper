@@ -1,5 +1,6 @@
 """Task runner tests use new private fixtures and literal local commands only."""
 import io
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -197,17 +198,10 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual(self.blobs()[0].read_bytes(), b"keep me\n")
 
     def test_user_interruption_retains_bytes_and_stops_only_owned_command(self):
-        class InterruptingOutput:
-            def write(self, data):
-                raise KeyboardInterrupt()
-
-            def flush(self):
-                pass
-
-        self.out = InterruptingOutput()
         with mock.patch.object(runner.executor, "approve_plan", side_effect=AssertionError("must retain")):
-            receipt, code = self.run_task("import time; print('before interrupt',flush=True); time.sleep(30)",
-                                          clean_success=True)
+            with mock.patch.object(runner, "_mirror", side_effect=KeyboardInterrupt()):
+                receipt, code = self.run_task("import time; print('before interrupt',flush=True); time.sleep(30)",
+                                              clean_success=True)
         self.assertEqual(code, 130)
         self.assertEqual(receipt["command"]["capture_status"], "interrupted")
         self.assertEqual(self.blobs()[0].read_bytes(), b"before interrupt\n")
@@ -227,6 +221,38 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertFalse(receipt["cleanup"]["attempted"])
         self.assertEqual(receipt["capture"]["stored_bytes"], 0)  # No acknowledgement was received.
         self.assertGreater(receipt["accounting"]["generated"]["apparent_bytes"], 0)
+
+    def test_mirror_restores_original_fd_flags_after_success_and_backpressure(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        with os.fdopen(write_fd, "wb", buffering=0) as sink:
+            original = fcntl.fcntl(write_fd, fcntl.F_GETFL)
+            runner._mirror(sink, b"prefix", deadline=time.monotonic() + 0.2)
+            self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), original)
+            self.assertEqual(os.read(read_fd, 6), b"prefix")
+            with self.assertRaises(runner._MirrorTimeout):
+                runner._mirror(sink, b"x" * (512 * 1024), deadline=time.monotonic() + 0.05)
+            self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), original)
+
+    def test_mirror_preserves_an_initially_nonblocking_descriptor(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        with os.fdopen(write_fd, "wb", buffering=0) as sink:
+            os.set_blocking(write_fd, False)
+            original = fcntl.fcntl(write_fd, fcntl.F_GETFL)
+            runner._mirror(sink, b"bytes", deadline=time.monotonic() + 0.2)
+            self.assertEqual(fcntl.fcntl(write_fd, fcntl.F_GETFL), original)
+
+    def test_arbitrary_python_sink_is_refused_without_calling_write_or_flush(self):
+        class UnknownSink:
+            def write(self, data):
+                raise AssertionError("arbitrary write must not be called")
+
+            def flush(self):
+                raise AssertionError("arbitrary flush must not be called")
+
+        with self.assertRaises(runner.RunnerError):
+            runner._mirror(UnknownSink(), b"value", deadline=time.monotonic() + 0.2)
 
     def test_interrupt_during_broker_write_is_not_retried(self):
         real = ProducerClient.write

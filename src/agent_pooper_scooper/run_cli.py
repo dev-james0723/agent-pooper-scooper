@@ -1,8 +1,18 @@
 """User-facing bounded foreground task runner."""
 import argparse
 import sys
+import time
 
 from . import runner
+
+
+def _summary(text):
+    # A full stderr pipe must not re-block after the capture timeout. No Python
+    # buffer is filled, so interpreter shutdown has no deferred summary flush.
+    try:
+        runner._mirror(sys.stderr, (text + "\n").encode(), deadline=time.monotonic() + 0.2)
+    except (Exception, KeyboardInterrupt):
+        pass  # The private receipt remains authoritative if the sink is full.
 
 
 def run(args):
@@ -15,15 +25,15 @@ def run(args):
             timeout=args.timeout, max_output_bytes=args.max_output_bytes,
             stdout=sys.stdout, stderr=sys.stderr)
     except (Exception, KeyboardInterrupt):
-        print("aps run: refused or interrupted; inspect the selected run directory before retrying", file=sys.stderr)
+        _summary("aps run: refused or interrupted; inspect the selected run directory before retrying")
         return 125
     removed = receipt["cleanup"]["removed"]
-    print("\naps run: command exit=" + str(receipt["command"]["exit_code"])
+    _summary("\naps run: command exit=" + str(receipt["command"]["exit_code"])
           + "; capture=" + receipt["command"]["capture_status"]
           + "; stored=" + str(receipt["capture"]["stored_bytes"]) + " bytes"
           + "; cleanup=" + receipt["cleanup"]["status"]
           + "; confirmed removed=" + str(removed["bytes"]) + " bytes"
-          + "; reclaimed capacity unknown; private report: report.json", file=sys.stderr)
+          + "; reclaimed capacity unknown; private report: report.json")
     return code
 
 

@@ -2,10 +2,14 @@
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
+import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_pooper_scooper import run_cli
@@ -54,6 +58,43 @@ class RunCliTests(unittest.TestCase):
         self.assertEqual(code, 125)
         self.assertNotIn("private-program", err)
         self.assertTrue((self.run_dir / "report.json").exists())
+
+    def test_unread_stdout_and_stderr_pipes_cannot_disable_command_timeout(self):
+        # Real nested CLI processes; deliberately never drain the selected pipe
+        # until wait() confirms exit. This reproduces sink backpressure, including
+        # contention with the final summary when the selected pipe is stderr.
+        source_root = str(Path(__file__).resolve().parents[1] / "src")
+        for selected, descriptor in (("stdout", 1), ("stderr", 2)):
+            with self.subTest(stream=selected):
+                destination = self.run_dir.parent / ("blocked-" + selected)
+                command = [sys.executable, "-m", "agent_pooper_scooper", "run",
+                           "--run-dir", str(destination), "--timeout", "0.2", "--clean-success", "--",
+                           sys.executable, "-c", f"import os; os.write({descriptor}, b'x' * (512 * 1024))"]
+                environment = dict(os.environ, PYTHONPATH=source_root)
+                before = time.monotonic()
+                process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE if selected == "stdout" else subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE if selected == "stderr" else subprocess.DEVNULL)
+                try:
+                    code = process.wait(timeout=4)
+                    elapsed = time.monotonic() - before
+                    self.assertEqual(code, 124)
+                    self.assertLess(elapsed, 4)
+                    receipt = json.loads((destination / "report.json").read_text())
+                    self.assertEqual(receipt["command"]["capture_status"], "timed_out")
+                    self.assertFalse(receipt["capture"]["complete"])
+                    self.assertFalse(receipt["cleanup"]["attempted"])
+                    self.assertEqual(receipt["cleanup"]["removed"], {"count": 0, "bytes": 0})
+                    blobs = list((destination / "store" / "artifacts").glob("*.blob"))
+                    self.assertGreater(sum(p.stat().st_size for p in blobs), 0)
+                    self.assertEqual(sum(p.stat().st_size for p in blobs), receipt["capture"]["stored_bytes"])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=2)
+                    for pipe in (process.stdout, process.stderr):
+                        if pipe is not None:
+                            pipe.close()
 
 
 if __name__ == "__main__":
