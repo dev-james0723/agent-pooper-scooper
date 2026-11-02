@@ -133,6 +133,22 @@ class PathPolicyTests(unittest.TestCase):
         self.assertFalse(safe_relative_path(".github/unsafe.yml"))
 
 
+class NativeSourcePolicyTests(GateTestCase):
+    def test_only_exact_native_source_tree_is_allowed(self):
+        for path in ("macos/APSMenuBar/Package.swift", "macos/APSMenuBar/Sources/APSMenuBar/App.swift", "macos/APSMenuBar/Tests/APSMenuBarTests/AppTests.swift"):
+            self.assertTrue(safe_relative_path(path), path)
+        for path in ("macos/private.json", "macos/APSMenuBar/config.json", "macos/APSMenuBar/.build/debug/App.swift", "macos/APSMenuBar/Sources/APSMenuBar/owner.json", "macos/Other/Package.swift"):
+            self.assertFalse(safe_relative_path(path), path)
+
+    def test_native_sources_are_scanned_not_exempted(self):
+        self.repo.write("macos/APSMenuBar/Sources/APSMenuBar/App.swift", "// public fixture\n")
+        self.repo.commit("feat: native source")
+        self.assertGatePasses()
+        self.repo.write("macos/APSMenuBar/Sources/APSMenuBar/App.swift", "// " + FAKE_TOKEN + "\n")
+        self.repo.commit("test: synthetic secret")
+        self.assertGateFails("github-token")
+
+
 class PackagingMetadataTests(GateTestCase):
     def test_packaging_files_are_allowed_and_scanned(self):
         self.repo.write("setup.cfg", "[metadata]\nname = public-fixture\n")

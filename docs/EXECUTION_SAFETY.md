@@ -76,3 +76,11 @@ The design adapts coordination ideas, not source, from [containerd v2.4.2 metada
 Primary interface evidence: [Python unlink](https://docs.python.org/3.10/library/os.html#os.unlink), [Apple flock descriptor semantics](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html), [SQLite synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous) and [fullfsync](https://www.sqlite.org/pragma.html#pragma_fullfsync), [Darwin statfs ABI](https://github.com/apple-oss-distributions/xnu/blob/ac9718fb1af618d5ce8678d0dc6e8a58f252216f/bsd/sys/mount.h), and [Linux mountinfo](https://docs.kernel.org/filesystems/proc.html#proc-pid-mountinfo-information-about-mounts). Darwin observations currently require the known 64-bit ABI and local writable APFS; Intel selects the explicit INODE64 symbols. Linux supports observed writable ext4/xfs/btrfs only. Unknown interfaces, malformed tables, unsupported filesystems and ambiguous topology refuse. Hosted Linux validation is a separate acceptance gate from local macOS tests.
 
 Development tests use only temporary newly created stores and generated synthetic bytes. Actual fixture unlinks, same-process producer waiters across prepare/finish commits, a separate-process fresh-lock canary, crash boundaries, partial accounting and installed CLI flows are required evidence; passing them is not proof of unsupported hostile containment, hardware power loss or global native AO/Kynlo fencing. Native lifecycle observations and notification transports remain separate product integrations with their own evidence and delivery classifications. They cannot manufacture a managed deletion capability.
+
+## Optional local autopilot
+
+The [autopilot](AUTOPILOT.md) snapshots owner policy before new capture and
+automates exact owner grants only for confirmed successful disposable output.
+Its policy lock serializes hold/disable through collection. Pending or ambiguous
+automatic effects never receive a replacement grant. Native discovery remains
+read-only; all managed protections and excluded actors above still apply.

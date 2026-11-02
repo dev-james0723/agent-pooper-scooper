@@ -74,3 +74,8 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_cli_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"
           "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tests/installed_preview_smoke.py" "$RUNNER_TEMP/aps-runtime/bin/aps"
+          FIXTURES=$("$RUNNER_TEMP/aps-runtime/bin/python" -c 'import os,pathlib; print(pathlib.Path(os.environ["RUNNER_TEMP"]).resolve())')
+          "$RUNNER_TEMP/aps-runtime/bin/python" -B "$GITHUB_WORKSPACE/tools/accept_autopilot.py" --aps "$RUNNER_TEMP/aps-runtime/bin/aps" --fixture-parent "$FIXTURES"
+      - name: Native model tests
+        if: runner.os == 'macOS'
+        run: cd macos/APSMenuBar && swift test -j 2

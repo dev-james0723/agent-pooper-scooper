@@ -6,7 +6,7 @@
 
 Agent Pooper Scooper is an open-source project for **task-aware, safety-first disk cleanup and friendly Scoop Reports**. The goal: reclaim disposable scratch space without destroying work that AI coding agents, other tasks, or future resumed sessions might still need.
 
-> **Preview 0.1.0a1: native disk reports, a scheduled macOS monitor, and a foreground task-output runner.** Inspect real agent/project disk usage immediately. Run a batch command with `aps run` to capture its new diagnostic output and, with `--clean-success`, collect only that output after complete success. Existing native files, worktrees, caches and session histories remain outside cleanup. This is a usable bounded preview; it is not a general automatic cleaner for historical agent data.
+> **Preview 0.2.0a1: safe local autopilot and a native macOS menu bar.** Observe recognizable agent processes and automatically collect new, explicitly disposable APS-captured diagnostics after successful completion and 24-hour retention. Pause or hold cleanup, inspect exact receipts, and optionally add advisory native-agent startup guidance. Existing native files, worktrees, caches and session histories remain outside cleanup. This is not a heuristic cleaner for historical agent data.
 
 ## Start here
 
@@ -41,6 +41,15 @@ capacity. Small runs can retain more metadata than the output they remove.
 See [native reports](docs/HOST_REPORTS.md), [the task runner](docs/TASK_RUNNER.md),
 and [installation and monitoring](docs/INSTALL.md). Do not wrap an entire
 coding-agent session with disposable-output cleanup: its output may be valuable.
+
+## Automatic cleanup
+
+See [autopilot setup and bounds](docs/AUTOPILOT.md), [native menu-bar setup](docs/MENUBAR.md) and
+[advisory agent startup integration](docs/AGENT_HOOKS.md). The owner-enabled scheduler
+runs every 60 seconds; cleanup applies only to new enrolled disposable output, not
+all files touched by detected agents. This preview retains audit records and caps
+a policy at 128 lifetime enrollments; it refuses further enrollment rather than
+silently deleting history.
 
 ## Why?
 
@@ -190,3 +199,10 @@ MIT — see [LICENSE](LICENSE).
 ## AO contributions and review
 
 This product can be developed by an Agent Orchestrator team, but only files from this dedicated public repository may be published. See [the AO-to-GitHub workflow](docs/AO_SYNC.md) for prepublication safeguards, local dry-run and draft pull requests. No private orchestrator history is synchronized.
+
+## Safe autopilot preview (0.2.0a1)
+
+Owner-enabled periodic cleanup is available for **new explicitly disposable APS
+wrapper capture** after successful completion and a default 24-hour retention.
+Automatic same-UID agent discovery is read-only and does not enroll native
+sessions or files. See [autopilot controls, installation and limits](docs/AUTOPILOT.md).

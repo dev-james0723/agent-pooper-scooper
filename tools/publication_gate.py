@@ -187,6 +187,19 @@ def safe_relative_path(value: str, *, directory: bool = False) -> bool:
         return False
     if any(p.lower() in BLOCKED_COMPONENTS for p in components):
         return False
+    if components[0] == "skills":
+        return (value in {"skills", "skills/aps-autopilot"} if directory
+                else value == "skills/aps-autopilot/SKILL.md")
+    if components[0] == "macos":
+        native_directories = {
+            "macos", "macos/APSMenuBar", "macos/APSMenuBar/Sources",
+            "macos/APSMenuBar/Sources/APSMenuBar", "macos/APSMenuBar/Tests",
+            "macos/APSMenuBar/Tests/APSMenuBarTests",
+        }
+        if directory:
+            return value in native_directories
+        return value == "macos/APSMenuBar/Package.swift" or bool(re.fullmatch(
+            r"macos/APSMenuBar/(?:Sources/APSMenuBar|Tests/APSMenuBarTests)/[A-Za-z0-9_]+\.swift", value))
     if directory and len(components) == 1:
         return value in ALLOWED_DIRECTORIES
     if len(components) == 1:

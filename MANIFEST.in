@@ -3,3 +3,6 @@ recursive-include docs *.md *.json
 recursive-include tests *.py
 recursive-include tools *.py
 include .github/workflows/ci.yml
+
+recursive-include skills *.md
+recursive-include macos *.swift

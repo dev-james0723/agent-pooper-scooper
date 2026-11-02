@@ -238,6 +238,8 @@ def build_parser():
     host_cli.add_commands(commands)
     monitor.add_commands(commands)
     run_cli.add_commands(commands)
+    from . import autopilot_cli
+    autopilot_cli.add_commands(commands)
     return parser
 
 
